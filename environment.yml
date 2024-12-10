@@ -1,4 +1,4 @@
-name: stylegan3
+name: sgan3
 channels:
   - pytorch
   - nvidia
@@ -8,15 +8,15 @@ dependencies:
   - pip
   - numpy>=1.20
   - click>=8.0
-  - pillow=8.3.1
-  - scipy=1.7.1
+  - pillow>=8.3.1
+  - scipy>=1.7.1
   - pytorch::pytorch=1.11  # We can now use Pytorch 1.11!
   - nvidia::cudatoolkit=11.3  # Necessary to remove previous PR by @edstoica
-  - requests=2.26.0
-  - tqdm=4.62.2
-  - ninja=1.10.2
-  - matplotlib=3.4.2
-  - imageio=2.9.0
+  - requests>=2.26.0
+  - tqdm>=4.62.2
+  - ninja=>1.10.2
+  - matplotlib>=3.4.2
+  - imageio>=2.9.0
   - pip:
     - imgui==1.3.0
     - glfw==2.2.0
@@ -27,7 +27,7 @@ dependencies:
     - psutil  # PR #125 by @fastflair / #111 by @siddharthksah
     - tensorboard  # PR #125 by @fastflair
     - torchvision==0.12.0  # For "Discriminator Synthesis" / discriminator_synthesis.py
-    - pyperlin  # For "Discriminator Synthesis" / discriminator_synthesis.py
+#    - pyperlin  # For "Discriminator Synthesis" / discriminator_synthesis.py
     - scikit-learn  # For "Self-Distilled StyleGAN" / multimodal_truncation.py
     - moviepy==1.0.3
     - ffmpeg-python==0.2.0
