@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 from torch.autograd import Variable
 from torchvision import transforms
 
@@ -17,7 +18,8 @@ import numpy as np
 
 import os
 import click
-from typing import Union, Tuple, Optional, List, Type
+import shutil
+from typing import Union, Tuple, Optional, List, Type, Dict
 from tqdm import tqdm
 import re
 
@@ -70,7 +72,11 @@ def get_image(seed: int = 0,
         if image_noise == 'random':
             starting_image = f'random_image-seed_{seed:08d}.jpg'
             image = Image.fromarray(rnd.randint(0, 255, (image_size, image_size, 3), dtype='uint8'))
-        elif image_noise == 'perlin':
+        elif image_noise == 'gray':
+            starting_image = f'gray_image-seed_{seed:08d}.jpg'
+            image = Image.fromarray(127 * np.ones((image_size, image_size, 3), dtype='uint8'))
+
+        elif 'perlin' in image_noise:
             try:
                 # Graciously using Mathieu Duchesneau's implementation: https://github.com/duchesneaumathieu/pyperlin
                 from pyperlin import FractalPerlin2D
@@ -131,13 +137,15 @@ def crop_resize_rotate(img: PIL.Image.Image,
 mean = np.array([0.485, 0.456, 0.406])
 std = np.array([0.229, 0.224, 0.225])
 
-preprocess = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
+preprocess = transforms.Compose(
+    [transforms.ToTensor(),
+     transforms.Lambda(lambda x: x * 2 - 1)])
 
 
 def deprocess(image_np: torch.Tensor) -> np.ndarray:
     image_np = image_np.squeeze().transpose(1, 2, 0)
-    image_np = image_np * std.reshape((1, 1, 3)) + mean.reshape((1, 1, 3))
-    # image_np = (image_np + 1.0) / 2.0
+    # image_np = image_np * std.reshape((1, 1, 3)) + mean.reshape((1, 1, 3))
+    image_np = (image_np + 1) / 2
     image_np = np.clip(image_np, 0.0, 1.0)
     image_np = (255 * image_np).astype('uint8')
     return image_np
@@ -320,7 +328,7 @@ def style_transfer_discriminator(
 @click.option('--cfg', type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), help='Model base configuration', default=None)
 # Synthesis options
 @click.option('--seeds', type=gen_utils.num_range, help='Random seeds to use. Accepted comma-separated values, ranges, or combinations: "a,b,c", "a-c", "a,b-d,e".', default='0')
-@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'perlin']), default='perlin', show_default=True)
+@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'gray', 'perlin']), default='perlin', show_default=True)
 @click.option('--starting-image', type=str, help='Path to image to start from', default=None)
 @click.option('--convert-to-grayscale', '-grayscale', is_flag=True, help='Add flag to grayscale the initial image')
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)', default=None)
@@ -503,7 +511,7 @@ def discriminator_dream(
 @click.option('--cfg', type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), help='Model base configuration', default=None)
 # Synthesis options
 @click.option('--seed', type=int, help='Random seed to use', default=0, show_default=True)
-@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'perlin']), default='random', show_default=True)
+@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'gray', 'perlin']), default='random', show_default=True)
 @click.option('--starting-image', type=str, help='Path to image to start from', default=None)
 @click.option('--convert-to-grayscale', '-grayscale', is_flag=True, help='Add flag to grayscale the initial image')
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)', default=None)
@@ -673,7 +681,7 @@ def discriminator_dream_zoom(
 @click.option('--cfg', type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), help='Model base configuration', default=None)
 # Synthesis options
 @click.option('--seed', type=int, help='Random seed to use', default=0, show_default=True)
-@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'perlin']), default='random', show_default=True)
+@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'gray', 'perlin']), default='random', show_default=True)
 @click.option('--starting-image', type=str, help='Path to image to start from', default=None)
 @click.option('--convert-to-grayscale', '-grayscale', is_flag=True, help='Add flag to grayscale the initial image')
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)', default=None)
@@ -1003,6 +1011,388 @@ def random_interpolation(
     stream = ffmpeg.input(os.path.join(run_dir, f'{image_noise}-interpolation_frame_%0{n_digits}d.jpg'), framerate=fps)
     stream = ffmpeg.output(stream, os.path.join(run_dir, f'{image_noise}-interpolation.mp4'), crf=20, pix_fmt='yuv420p')
     ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, cmd=ffmpeg_command)
+
+
+@main.command(name='direct-ascent', help='Direct Ascent Synthesis using StyleGAN Discriminator')
+@click.pass_context
+@click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
+@click.option('--cfg', type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), help='Model configuration', default=None)
+@click.option('--target', type=click.Choice(['real', 'fake', 'layer']), help='Optimization target', default='real')
+@click.option('--layer', type=str, help='Specific layer to target (if target=layer)', default='b16_conv1')
+@click.option('--resolution', type=int, help='Output image resolution', default=1024)
+@click.option('--iterations', type=int, help='Optimization iterations', default=200)
+@click.option('--lr', type=float, help='Learning rate', default=0.05)
+@click.option('--aug-strength', type=float, help='Augmentation strength (noise, shifts)', default=0.2)
+@click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)', default=None)
+@click.option('--seed', type=int, help='Random seed', default=0)
+@click.option('--starting-image', type=str, help='Path to image to start from', default=None)
+@click.option('--image-noise', type=click.Choice(['random', 'perlin', 'gray', 'gaussian', 'gray-perlin', 'black-perlin']), help='Type of noise for initialization', default='random')
+@click.option('--convert-to-grayscale', is_flag=True, help='Convert starting image to grayscale')
+@click.option('--outdir', type=click.Path(file_okay=False), help='Output directory', default=os.path.join(os.getcwd(), 'out', 'direct_ascent'))
+def direct_ascent_synthesis(
+        ctx: click.Context,
+        network_pkl: str,
+        cfg: Optional[str],
+        target: str,
+        layer: str,
+        resolution: int,
+        iterations: int,
+        lr: float,
+        aug_strength: float,
+        class_idx: Optional[int],
+        seed: int,
+        starting_image: Optional[str],
+        image_noise: str,
+        convert_to_grayscale: bool,
+        outdir: Union[str, os.PathLike],
+):
+    """Implement Direct Ascent Synthesis using StyleGAN's Discriminator"""
+    # Set random seed for reproducibility
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # Set up device
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+    # Load Discriminator
+    D = gen_utils.load_network('D', network_pkl, cfg, device)
+
+    # Adjust resolution to model's native resolution if needed
+    model_resolution = D.img_resolution
+    resolution = min(resolution, model_resolution)
+
+    # Add padding for augmentations (following the official implementation)
+    # They use ~25% padding on each side (56px for 224x224)
+    pad_size = int(resolution * 0.25)
+    padded_resolution = resolution + 2 * pad_size
+    print(f"Using resolution {resolution} with padding to {padded_resolution}")
+
+    # Parse class label for conditional models
+    class_label = None
+    if D.c_dim > 0:
+        # For conditional models, class must be specified
+        if class_idx is None:
+            click.echo('Warning: Model is conditional but no class specified. Using class 0.')
+            class_idx = 0
+        if class_idx >= D.c_dim:
+            click.echo(f'Warning: Class {class_idx} out of range (0-{D.c_dim - 1}). Using class 0.')
+            class_idx = 0
+        class_label = torch.zeros([1, D.c_dim], device=device)
+        class_label[:, class_idx] = 1
+    elif class_idx is not None:
+        click.echo('Warning: Model is unconditional but class specified. Ignoring class parameter.')
+
+    # Create the output directory
+    desc = f'direct-ascent-{target}'
+    if target == 'layer':
+        desc += f'-{layer}'
+    if class_idx is not None and D.c_dim > 0:
+        desc += f'-class{class_idx}'
+    if starting_image is not None:
+        desc += f'-from-{os.path.basename(starting_image).split(".")[0]}'
+    else:
+        desc += f'-{image_noise}'
+    run_dir = gen_utils.make_run_dir(outdir, desc)
+
+    # Determine the multi-resolution components
+    # We'll create components from 1×1 up to the target resolution
+    max_res_log2 = int(np.log2(padded_resolution))
+    # resolutions = [2 ** i for i in range(0, max_res_log2 + 1)]
+    # resolutions = [1, 8, 32, 64, 128, 512, 640, 768, 896, 1024]
+    # resolutions = [1, 2, 4, 8, 16, 32, 64]
+    resolutions = [int(np.rint(x)) for x in np.logspace(0, max_res_log2, 23, base=2)]  # Uniform in logspace [0, ..., 1024]
+    # resolutions = list(sorted(list(set(range(1, padded_resolution+1)))))
+
+    # Sanity check: remove duplicates
+    resolutions = list(dict.fromkeys(resolutions))
+
+    # Get starting image using the existing get_image function
+    if image_noise == 'gray':
+        # Create a gray image - this option is not in the original get_image function
+        print("Starting with gray image...")
+        gray_image = np.ones((padded_resolution, padded_resolution, 3), dtype=np.uint8) * 127
+        # Add a tiny bit of noise to break symmetry
+        noise = np.random.RandomState(seed).randint(-2, 3, (padded_resolution, padded_resolution, 3), dtype=np.int16)
+        gray_image = np.clip(gray_image + noise, 0, 255).astype(np.uint8)
+        pil_image = Image.fromarray(gray_image)
+        starting_img_name = f'gray_image-seed_{seed:08d}.jpg'
+        pil_image.save(os.path.join(run_dir, starting_img_name))
+    elif image_noise == 'gaussian':
+        # Create an image of a 2D Gaussian distribution, with center at the middle
+        # of the image and standard deviation of 1/2 of the resolution
+        print("Starting with Gaussian image...")
+        x = np.linspace(-1, 1, padded_resolution)
+        y = np.linspace(-1, 1, padded_resolution)
+        X, Y = np.meshgrid(x, y)
+        Z = np.exp(-((X ** 2 + Y ** 2) / (2 * (1 / 1.5) ** 2)))
+        Z = (Z - Z.min()) / (Z.max() - Z.min()) * 255
+        # Add a channel
+        Z = np.stack([Z] * 3, axis=-1)
+        pil_image = Image.fromarray(Z.astype(np.uint8))
+        starting_img_name = f'gaussian_image-seed_{seed:08d}.jpg'
+        pil_image.save(os.path.join(run_dir, starting_img_name))
+    else:
+        # Use the existing function for random, perlin, or from file
+        pil_image, starting_img_name = get_image(
+            seed=seed,
+            image_noise=image_noise,
+            starting_image=starting_image,
+            image_size=padded_resolution,
+            convert_to_grayscale=convert_to_grayscale,
+            device=device
+        )
+        # Save the starting image
+        pil_image.save(os.path.join(run_dir, starting_img_name))
+
+    # Convert PIL image to tensor in [-1, 1] range
+    initial_image = torch.tensor(np.array(pil_image), device=device, dtype=torch.float32)
+    initial_image = initial_image.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+    initial_image = initial_image / 127.5 - 1.0  # [0, 255] -> [-1, 1]
+
+    # Initialize components from the initial image
+    components = {}
+    parameters = []
+
+    # Decompose initial image into multiple resolutions
+    for res in resolutions:
+        if image_noise == 'gray-perlin':
+            # All components will be initialized with the same gray image, except the highest resolution
+            # which will be initialized with Perlin noise
+            if res == padded_resolution:
+                param = torch.nn.Parameter(initial_image.clone())
+            else:
+                # Let's make it darker gray
+                gray_image = (np.ones((res, res, 3)) * (255 * 0.5)).astype(np.uint8)
+                # Add a tiny bit of noise to break symmetry
+                # noise = np.random.RandomState(seed).randint(-2, 3, (res, res, 3), dtype=np.int16)
+                # gray_image = np.clip(gray_image + noise, 0, 255).astype(np.uint8)
+                initial_image = torch.tensor(gray_image, device=device, dtype=torch.float32)
+                initial_image = initial_image.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+                initial_image = initial_image / 127.5 - 1.0  # [0, 255] -> [-1, 1]
+                # Add small noise to help optimization
+                initial_image = initial_image + torch.randn_like(initial_image) * 0.01
+                param = torch.nn.Parameter(initial_image.clone())
+
+        else:
+            if res == 1:
+                # 1x1 is special case - just average the entire image
+                downsampled = F.adaptive_avg_pool2d(initial_image, (1, 1))
+                param = torch.nn.Parameter(downsampled.clone())
+            else:
+                # Downsample to this resolution
+                downsampled = F.interpolate(initial_image, size=(res, res), mode='bilinear', align_corners=False)
+                # Add small noise to help optimization
+                downsampled = downsampled + torch.randn_like(downsampled) * 0.01
+                param = torch.nn.Parameter(downsampled.clone())
+
+        components[res] = param
+        parameters.append(param)
+
+    # Prepare optimizer with all parameters
+    optimizer = optim.Adam(parameters, lr=lr)
+
+    # Create discriminator features wrapper for layer targeting
+    D_features = DiscriminatorFeatures(D).requires_grad_(False).to(device)
+
+    # Define objective function based on target
+    if target == 'real':
+        def objective_fn(image):
+            # Maximize discriminator output (predict as real)
+            return D(image, class_label)
+    elif target == 'fake':
+        def objective_fn(image):
+            # Minimize discriminator output (predict as fake)
+            return -D(image, class_label)
+    else:  # target == 'layer'
+        def objective_fn(image):
+            # Maximize activation of specific layer
+            features = D_features.get_layers_features(image, layers=[layer])
+            return sum(feat.norm() for feat in features)
+
+    # Save optimization progress
+    progress_images = []
+
+    # Optimization loop
+    for i in tqdm(range(iterations), desc=f'Optimizing {target}'):
+        # Combine multi-resolution components to form the image
+        image = torch.zeros(1, 3, padded_resolution, padded_resolution, device=device)
+        for res in resolutions:
+            # Upsample each component to full resolution
+            if res > 1:
+                upsampled = F.interpolate(components[res], size=(padded_resolution, padded_resolution), mode='bilinear',
+                                          align_corners=False)
+                image = image + upsampled
+            else:
+                # Handle 1×1 case specially - broadcast to fill the image
+                image = image + components[res].expand(-1, -1, padded_resolution, padded_resolution)
+
+        # Apply tanh to constrain pixel values to [-1, 1] range
+        image = (1 + torch.tanh(image)) / 2
+
+        # Apply augmentations to prevent adversarial patterns
+        augmented_images = []
+        num_augments = 8  # Multiple augmentations for stability
+
+        for _ in range(num_augments):
+            aug_img = image.clone()
+
+            # Random pixel shifts (important for preventing high-frequency artifacts)
+            # if resolution > 16:
+            #     max_shift = int(resolution * 0.05)  # 5% of resolution
+            #     shift_x = np.random.randint(-max_shift, max_shift + 1)
+            #     shift_y = np.random.randint(-max_shift, max_shift + 1)
+            #     aug_img = torch.roll(aug_img, shifts=(shift_y, shift_x), dims=(2, 3))
+
+            # Random shifts utilizing the padding area
+            shift_x = np.random.randint(-pad_size, pad_size + 1)
+            shift_y = np.random.randint(-pad_size, pad_size + 1)
+            aug_img = torch.roll(aug_img, shifts=(shift_y, shift_x), dims=(2, 3))
+
+            # Center crop to model_resolution
+            start_h = (padded_resolution - resolution) // 2
+            start_w = (padded_resolution - resolution) // 2
+            aug_img = aug_img[:, :, start_h:start_h + resolution, start_w:start_w + resolution]
+
+            # More diverse augmentations:
+            # 1. Add random noise
+            noise = torch.randn_like(aug_img) * aug_strength
+            aug_img = aug_img + noise
+
+            # 2. Small random brightness/contrast adjustment
+            if np.random.random() > 0.5:
+                brightness = 1.0 + (torch.rand(1, device=device) - 0.5) * 0.2  # ±10% brightness
+                aug_img = aug_img * brightness
+
+            # 3. Small random saturation adjustment for color models
+            if np.random.random() > 0.8:  # Occasional saturation change
+                saturation = 1.0 + (torch.rand(1, device=device) - 0.5) * 0.4  # ±20% saturation
+                # Convert to grayscale and interpolate
+                gray = aug_img.mean(dim=1, keepdim=True).repeat(1, 3, 1, 1)
+                aug_img = gray + saturation * (aug_img - gray)
+
+            # Clamp to valid range
+            aug_img = torch.clamp(aug_img, -1, 1)
+
+            augmented_images.append(aug_img)
+
+        # Compute loss across all augmentations (maximize objective)
+        loss = 0
+        for aug_img in augmented_images:
+            loss = loss - objective_fn(aug_img).mean()
+
+        # Optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # Save intermediate results
+        if (i + 1) % 20 == 0 or i == 0 or i == iterations - 1:
+            with torch.no_grad():
+                # Generate current image
+                current = torch.zeros(1, 3, resolution, resolution, device=device)
+                for res in resolutions:
+                    if res > 1:
+                        upsampled = F.interpolate(components[res], size=(resolution, resolution), mode='bilinear',
+                                                  align_corners=False)
+                        current = current + upsampled
+                    else:
+                        current = current + components[res].expand(-1, -1, resolution, resolution)
+                current = torch.tanh(current)
+
+                # Convert to numpy for saving
+                img_np = current.cpu().detach().numpy()[0].transpose(1, 2, 0)
+                img_np = (img_np + 1) / 2  # [-1, 1] to [0, 1]
+                img_np = (img_np * 255).astype(np.uint8)
+
+                # Save and store for progress visualization
+                save_path = os.path.join(run_dir, f'iteration_{i + 1:04d}.jpg')
+                Image.fromarray(img_np).save(save_path)
+                progress_images.append(img_np)
+
+    # Save final image and original starting image if applicable
+    with torch.no_grad():
+        # Reconstruct the final image from all components
+        final_image = torch.zeros(1, 3, resolution, resolution, device=device)
+        for res in resolutions:
+            if res > 1:
+                upsampled = F.interpolate(components[res], size=(resolution, resolution), mode='bilinear',
+                                          align_corners=False)
+                final_image = final_image + upsampled
+            else:
+                final_image = final_image + components[res].expand(-1, -1, resolution, resolution)
+        final_image = torch.tanh(final_image)
+
+    # Calculate final score
+    with torch.no_grad():
+        if target in ['real', 'fake']:
+            final_score = objective_fn(final_image).item()
+            score_type = "Discriminator score" if target == 'real' else "Negative discriminator score"
+            print(f"Final {score_type}: {final_score:.4f}")
+        else:
+            features = D_features.get_layers_features(final_image, layers=[layer])
+            final_score = sum(feat.norm().item() for feat in features)
+            print(f"Final layer activation norm: {final_score:.4f}")
+
+    # Convert to numpy and save
+    final_np = final_image.cpu().detach().numpy()[0].transpose(1, 2, 0)
+    final_np = (final_np + 1) / 2
+    final_np = (final_np * 255).astype(np.uint8)
+
+    Image.fromarray(final_np).save(os.path.join(run_dir, 'final_result.jpg'))
+
+    # Save individual resolution components
+    for res in resolutions:
+        with torch.no_grad():
+            comp = components[res]
+            if res > 1:
+                comp_upsampled = F.interpolate(comp, size=(resolution, resolution), mode='bilinear',
+                                               align_corners=False)
+            else:
+                comp_upsampled = comp.expand(-1, -1, resolution, resolution)
+            comp_image = torch.tanh(comp_upsampled)
+
+            comp_np = comp_image.cpu().detach().numpy()[0].transpose(1, 2, 0)
+            comp_np = (comp_np + 1) / 2
+            comp_np = (comp_np * 255).astype(np.uint8)
+
+            Image.fromarray(comp_np).save(os.path.join(run_dir, f'component_res{res}x{res}.jpg'))
+
+    print(f"Direct Ascent Synthesis complete. Results saved to {run_dir}")
+
+    # Optional: create a visualization of the optimization progress
+    if len(progress_images) > 1:
+        try:
+            import imageio
+            imageio.mimsave(os.path.join(run_dir, 'optimization_progress.gif'),
+                            progress_images, duration=0.5)
+        except ImportError:
+            print("imageio not installed, skipping GIF creation")
+
+    # Save the configuration used
+    ctx.obj = {
+        'network_pkl': network_pkl,
+        'cfg': cfg,
+        'synthesis_options': {
+            'target': target,
+            'layer': layer,
+            'resolutions': resolutions,
+            'iterations': iterations,
+            'lr': lr,
+            'aug_strength': aug_strength,
+            'class_idx': class_idx,
+            'seed': seed,
+            'starting_image': starting_image,
+            'image_noise': image_noise,
+            'convert_to_grayscale': convert_to_grayscale,
+            'outdir': run_dir
+        }
+    }
+    gen_utils.save_config(ctx=ctx, run_dir=run_dir)
+
+    # Save the current file in run_dir (no gen_utils function exists yet)
+    current_file = os.path.abspath(__file__)
+    shutil.copy(current_file, run_dir)
+
 
 # ----------------------------------------------------------------------------
 

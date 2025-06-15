@@ -181,7 +181,7 @@ def parse_all_projected_dlatents(s: str) -> List[torch.Tensor]:
 
 
 def load_network(name: str, network_pkl: Union[str, os.PathLike], cfg: Optional[str], device: torch.device):
-    """Load and return the discriminator D from a trained network."""
+    """Load and return the D/G/G_ema from a trained network."""
     # Define the model
     if cfg is not None:
         assert network_pkl in resume_specs[cfg], f'{network_pkl} is not available for config {cfg}! \nAvailable models: {resume_specs[cfg]}'
@@ -193,17 +193,17 @@ def load_network(name: str, network_pkl: Union[str, os.PathLike], cfg: Optional[
     return net
 
 
-def parse_class(G, class_idx: int, ctx: click.Context) -> Union[int, Type[None]]:
-    """Parse the class_idx and return it, if it's allowed by the conditional model G"""
-    if G.c_dim == 0:
+def parse_class(net, class_idx: int, ctx: click.Context) -> Union[int, Type[None]]:
+    """Parse the class_idx and return it, if it's allowed by the conditional network"""
+    if net.c_dim == 0:
         # Unconditional model
         return None
     # Conditional model, so class must be specified by user
     if class_idx is None:
         ctx.fail('Must specify class label with --class when using a conditional network!')
-    if class_idx not in range(G.c_dim):
-        ctx.fail(f'Your class label can be at most {G.c_dim - 1}!')
-    print(f'Using class {class_idx} (available labels: range({G.c_dim - 1})...)')
+    if class_idx not in range(net.c_dim):
+        ctx.fail(f'Your class label can be at most {net.c_dim - 1}!')
+    print(f'Using class {class_idx} (available labels: range({net.c_dim - 1})...)')
     return class_idx
 
 
@@ -617,10 +617,7 @@ resume_specs = {
             'ffhqu256':      'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/stylegan3-t-ffhqu-256x256.pkl',
             'metfaces1024':  'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/stylegan3-t-metfaces-1024x1024.pkl',
             'metfacesu1024': 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/stylegan3-t-metfacesu-1024x1024.pkl',
-            # Community models, found in: https://github.com/justinpinkney/awesome-pretrained-stylegan3 by @justinpinkney
-            'landscapes256': 'https://drive.google.com/u/0/uc?export=download&confirm=eJHe&id=14UGDDOusZ9TMb-pOrF0PAjMGVWLSAii1',  # Thanks to @justinpinkney
-            'wikiart1024':   'https://drive.google.com/u/0/uc?export=download&confirm=2tz5&id=18MOpwTMJsl_Z17q-wQVnaRLCUFZYSNkj',  # Thanks to @justinpinkney
-            # -> Wombo Dream-based models found in: https://github.com/edstoica/lucid_stylegan3_datasets_models by @edstoica; TODO: more to come, update the list as they are released!
+            # Community models, Wombo Dream-based models found in: https://github.com/edstoica/lucid_stylegan3_datasets_models by @edstoica; TODO: more to come, update the list as they are released!
             'mechfuture256': 'https://www.dropbox.com/s/v2oie53cz62ozvu/network-snapshot-000029.pkl?dl=1',  # Thanks to @edstoica; 29kimg tick
             'vivflowers256': 'https://www.dropbox.com/s/o33lhgnk91hstvx/network-snapshot-000069.pkl?dl=1',  # Thanks to @edstoica; 68kimg tick
             'alienglass256': 'https://www.dropbox.com/s/gur14k0e7kspguy/network-snapshot-000038.pkl?dl=1',  # Thanks to @edstoica; 38kimg tick

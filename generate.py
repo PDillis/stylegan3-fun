@@ -470,7 +470,7 @@ def random_interpolation_video(
         frame_idx = int(np.clip(np.round(t * fps), 0, num_frames - 1))
         latents = torch.from_numpy(all_latents[frame_idx]).to(device)
         # Do the truncation trick (with the global centroid or the new center provided by the user)
-        w = G.mapping(latents, None)
+        w = G.mapping(latents, label)
         w = w_avg + (w - w_avg) * truncation_psi
 
         # Get the images
