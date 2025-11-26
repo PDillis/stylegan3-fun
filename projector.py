@@ -362,7 +362,7 @@ def project(
 @click.option('--init-lr', '-lr', 'initial_learning_rate', type=float, help='Initial learning rate of the optimization process', default=0.1, show_default=True)
 @click.option('--constant-lr', 'constant_learning_rate', is_flag=True, help='Add flag to use a constant learning rate throughout the optimization (turn off the rampup/rampdown)')
 @click.option('--reg-noise-weight', '-regw', 'regularize_noise_weight', type=float, help='Noise weight regularization', default=1e5, show_default=True)
-@click.option('--seed', type=int, help='Random seed', default=303, show_default=True)
+@click.option('--seed', type=int, help='Torch random number generator seed used to determine input and synthesis noise', default=303, show_default=True)
 @click.option('--stabilize-projection', is_flag=True, help='Add flag to stabilize the latent space/anchor to w_avg, making it easier to project (only for StyleGAN3 config-r/t models)')
 # Video options
 @click.option('--save-video', '-video', is_flag=True, help='Save an mp4 video of optimization progress')
@@ -371,7 +371,7 @@ def project(
 # Options on which space to project to (W or W+) and where to start: the middle point of W (w_avg) or a specific seed
 @click.option('--project-in-wplus', '-wplus', is_flag=True, help='Project in the W+ latent space')
 @click.option('--start-wavg', '-wavg', type=bool, help='Start with the average W vector, ootherwise will start from a random seed (provided by user)', default=True, show_default=True)
-@click.option('--projection-seed', type=int, help='Seed to start projection from', default=None, show_default=True)
+@click.option('--projection-seed', type=int, help='Seed vector to use as the starting point of the projection', default=None, show_default=True)
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi to use in projection when using a projection seed', default=0.7, show_default=True)
 # Decide the loss to use when projecting (all other apart from o.g. StyleGAN2's are experimental, you can select the VGG16 features/layers to use in the im2sgan loss)
 @click.option('--loss-paper', '-loss', type=click.Choice(['sgan2', 'im2sgan', 'discriminator', 'clip']), help='Loss to use (if using "im2sgan", make sure to norm the VGG16 features)', default='sgan2', show_default=True)
@@ -380,6 +380,7 @@ def project(
 @click.option('--vgg-sqrt-normed', 'sqrt_normed', is_flag=True, help='Add flag to norm the VGG16 features by the square root of the number of elements per layer that was used')
 # Extra parameters for saving the results
 @click.option('--save-every-step', '-saveall', is_flag=True, help='Save every step taken in the projection (save both the dlatent as a.npy and its respective image).')
+@click.option('--save-n-step', type=int, help='Save every n steps taken in the projection', default=1, show_default=True)
 @click.option('--outdir', type=click.Path(file_okay=False), help='Directory path to save the results', default=os.path.join(os.getcwd(), 'out', 'projection'), show_default=True, metavar='DIR')
 @click.option('--description', '-desc', type=str, help='Extra description to add to the experiment name', default='')
 def run_projection(
@@ -404,6 +405,7 @@ def run_projection(
         normed: bool,
         sqrt_normed: bool,
         save_every_step: bool,
+        save_n_step: int,
         outdir: str,
         description: str,
 ):
@@ -415,6 +417,7 @@ def run_projection(
     python projector.py --target=~/mytarget.png --project-in-wplus --save-video --num-steps=5000 \\
         --network=https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/ffhq.pkl
     """
+    # Set PyTorch random number generator to user provided seed, or the default of 303
     torch.manual_seed(seed)
 
     # If we're not starting from the W midpoint, assert the user fed a seed to start from
@@ -489,6 +492,7 @@ def run_projection(
         'seed': seed,
         'video_fps': fps,
         'save_every_step': save_every_step,
+        'save_n_step': save_n_step,
         'run_config': run_config
     }
     # Save the run configuration
@@ -510,25 +514,26 @@ def run_projection(
     target_pil.save(os.path.join(run_dir, 'target.png'))
 
     if save_every_step:
-        # Save every projected frame and W vector. TODO: This can be optimized to be saved as training progresses
+        # Save every projected frame and W vector, except the final step.
         n_digits = int(np.log10(num_steps)) + 1 if num_steps > 0 else 1
-        for step in tqdm(range(num_steps), desc='Saving projection results', unit='steps'):
+        for step in tqdm(range(0, num_steps, save_n_step), desc='Saving projection results', unit='steps'):
+            print(f'{step} / {num_steps}')
             w = projected_w_steps[step]
             synth_image = gen_utils.w_to_img(G, dlatents=w, noise_mode='const')[0]
             PIL.Image.fromarray(synth_image, 'RGB').save(f'{result_name}_step{step:0{n_digits}d}.png')
             np.save(f'{npy_name}_step{step:0{n_digits}d}.npy', w.unsqueeze(0).cpu().numpy())
-    else:
-        # Save only the final projected frame and W vector.
-        print('Saving projection results...')
-        projected_w = projected_w_steps[-1]
-        synth_image = gen_utils.w_to_img(G, dlatents=projected_w, noise_mode='const')[0]
-        PIL.Image.fromarray(synth_image, 'RGB').save(f'{result_name}_final.png')
-        np.save(f'{npy_name}_final.npy', projected_w.unsqueeze(0).cpu().numpy())
+    
+    # Save the final projected frame and W vector.
+    print('Saving projection results...')
+    projected_w = projected_w_steps[-1]
+    synth_image = gen_utils.w_to_img(G, dlatents=projected_w, noise_mode='const')[0]
+    PIL.Image.fromarray(synth_image, 'RGB').save(f'{result_name}_final.png')
+    np.save(f'{npy_name}_final.npy', projected_w.unsqueeze(0).cpu().numpy())
 
     # Save the optimization video and compress it if so desired
     if save_video:
-        video = imageio.get_writer(f'{result_name}.mp4', mode='I', fps=fps, codec='libx264', bitrate='16M')
-        print(f'Saving optimization progress video "{result_name}.mp4"')
+        video = imageio.get_writer(f'{result_name}_{num_steps}.mp4', mode='I', fps=fps, codec='libx264', bitrate='16M')
+        print(f'Saving optimization progress video "{result_name}_{num_steps}.mp4"')
         for projected_w in projected_w_steps:
             synth_image = gen_utils.w_to_img(G, dlatents=projected_w, noise_mode='const')[0]
             video.append_data(np.concatenate([target_uint8, synth_image], axis=1))  # left side target, right projection
@@ -536,7 +541,7 @@ def run_projection(
 
     if save_video and compress:
         # Compress the video; might fail, and is a basic command that can also be better optimized
-        gen_utils.compress_video(original_video=f'{result_name}.mp4',
+        gen_utils.compress_video(original_video=f'{result_name}_{num_steps}.mp4',
                                  original_video_name=f'{result_name.split(os.sep)[-1]}',
                                  outdir=run_dir,
                                  ctx=ctx)
