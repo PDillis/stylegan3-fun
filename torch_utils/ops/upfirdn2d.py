@@ -9,6 +9,7 @@
 """Custom PyTorch ops for efficient resampling of 2D images."""
 
 import os
+import warnings
 import numpy as np
 import torch
 
@@ -23,14 +24,23 @@ _plugin = None
 def _init():
     global _plugin
     if _plugin is None:
-        _plugin = custom_ops.get_plugin(
-            module_name='upfirdn2d_plugin',
-            sources=['upfirdn2d.cpp', 'upfirdn2d.cu'],
-            headers=['upfirdn2d.h'],
-            source_dir=os.path.dirname(__file__),
-            extra_cuda_cflags=['--use_fast_math', '--allow-unsupported-compiler'],
-        )
-    return True
+        if custom_ops.use_ref_ops():
+            _plugin = False
+        else:
+            try:
+                _plugin = custom_ops.get_plugin(
+                    module_name='upfirdn2d_plugin',
+                    sources=['upfirdn2d.cpp', 'upfirdn2d.cu'],
+                    headers=['upfirdn2d.h'],
+                    source_dir=os.path.dirname(__file__),
+                    extra_cuda_cflags=['--use_fast_math', '--allow-unsupported-compiler'],
+                )
+            except Exception as e:
+                _plugin = False
+                warnings.warn('Failed to build the upfirdn2d CUDA plugin; falling back to the (slower) reference '
+                              'PyTorch implementation. Check CUDA_HOME points to a full CUDA toolkit, or set '
+                              f'STYLEGAN3_USE_REF_OPS=1 to silence this warning. Build error:\n{e}')
+    return _plugin is not False
 
 def _parse_scaling(scaling):
     if isinstance(scaling, int):
