@@ -90,7 +90,7 @@ def get_image(seed: int = 0,
             noise = noise.cpu().numpy()
             # Stretch to the full [0, 255] range (raw fractal Perlin rarely reaches +-1)
             noise = (noise - noise.min()) / (np.ptp(noise) + 1e-8)
-            image = Image.fromarray((255 * noise).astype(np.uint8).transpose(1, 2, 0), 'RGB')
+            image = Image.fromarray((255 * noise).astype(np.uint8).transpose(1, 2, 0))
 
     if convert_to_grayscale:
         image = image.convert('L').convert('RGB')
@@ -484,7 +484,7 @@ def style_transfer_discriminator(
     output = deprocess(input_img.cpu().data.numpy())
 
     # Save result
-    Image.fromarray(output, 'RGB').save(os.path.join(run_dir, 'stylized.jpg'))
+    Image.fromarray(output).save(os.path.join(run_dir, 'stylized.jpg'))
 
     # Save configuration
     ctx.obj = {
@@ -623,7 +623,7 @@ def discriminator_dream(
 
                 # Save the resulting dreamed image
                 filename = f'layer-{layer}_dreamed_{os.path.basename(starting_image).split(".")[0]}.jpg'
-                Image.fromarray(dreamed_image, 'RGB').save(os.path.join(run_dir, filename))
+                Image.fromarray(dreamed_image).save(os.path.join(run_dir, filename))
 
     else:
         if 'use_all' in layers:
@@ -658,7 +658,7 @@ def discriminator_dream(
 
             # Save the resulting image and initial image
             filename = f'dreamed_{os.path.basename(starting_image)}'
-            Image.fromarray(dreamed_image, 'RGB').save(os.path.join(run_dir, filename))
+            Image.fromarray(dreamed_image).save(os.path.join(run_dir, filename))
             image.save(os.path.join(run_dir, os.path.basename(starting_image)))
             starting_image = None
 
@@ -850,10 +850,10 @@ def discriminator_dream_zoom(
 
         # Save the resulting image and initial image
         filename = f'dreamed_{idx + 1:0{n_digits}d}.jpg'
-        Image.fromarray(dreamed_image, 'RGB').save(os.path.join(run_dir, filename))
+        Image.fromarray(dreamed_image).save(os.path.join(run_dir, filename))
 
         # Now, the dreamed image is the starting image
-        image = Image.fromarray(dreamed_image, 'RGB')
+        image = Image.fromarray(dreamed_image)
 
     # Save the final video
     gen_utils.save_video_from_images(run_dir=run_dir, image_names=f'dreamed_%0{n_digits}d.jpg',
@@ -985,10 +985,10 @@ def channel_zoom(
 
         # Save the resulting image and initial image
         filename = f'dreamed_{idx + 1:0{n_digits}d}.jpg'
-        Image.fromarray(dreamed_image, 'RGB').save(os.path.join(run_dir, filename))
+        Image.fromarray(dreamed_image).save(os.path.join(run_dir, filename))
 
         # Now, the dreamed image is the starting image
-        image = Image.fromarray(dreamed_image, 'RGB')
+        image = Image.fromarray(dreamed_image)
 
     # Save the final video
     gen_utils.save_video_from_images(run_dir=run_dir, image_names=f'dreamed_%0{n_digits}d.jpg', video_name='channel-zoom',
@@ -1169,7 +1169,7 @@ def random_interpolation(
 
         # Save the resulting image and initial image
         filename = f'{image_noise}-interpolation_frame_{idx:0{n_digits}d}.jpg'
-        Image.fromarray(dreamed_image, 'RGB').save(os.path.join(run_dir, filename))
+        Image.fromarray(dreamed_image).save(os.path.join(run_dir, filename))
 
     # Save the configuration used
     ctx.obj = {
@@ -1351,7 +1351,7 @@ def discriminator_dream_video(
             # Crop back to the slice size (made even, as yuv420p requires even dimensions)
             dreamed_frame = dreamed_frame[:h - h % 2, :w - w % 2]
             filename = f'frame_{idx:0{n_digits}d}.jpg'
-            Image.fromarray(dreamed_frame, 'RGB').save(os.path.join(axis_dir, filename))
+            Image.fromarray(dreamed_frame).save(os.path.join(axis_dir, filename))
 
         gen_utils.save_video_from_images(run_dir=axis_dir, image_names=f'frame_%0{n_digits}d.jpg',
                                          video_name=f'dream-video-{axis}_axis', fps=fps, reverse_video=False)
