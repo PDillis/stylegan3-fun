@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.multiprocessing
 from torchvision import transforms
 
 import PIL
@@ -212,10 +213,13 @@ _clip_max = torch.as_tensor((1.0 - mean) / std, dtype=torch.float32).view(1, -1,
 
 
 def deprocess(image: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
-    """Undo the preprocessing normalization and return a uint8 HWC image"""
+    """Undo the preprocessing normalization; returns a uint8 HWC image,
+    or a BHWC stack if a batch of more than one image is given"""
     if torch.is_tensor(image):
         image = image.detach().cpu().numpy()
-    image = image.squeeze().transpose(1, 2, 0)
+    if image.ndim == 4 and image.shape[0] == 1:
+        image = image[0]
+    image = image.transpose(0, 2, 3, 1) if image.ndim == 4 else image.transpose(1, 2, 0)
     image = image * std.reshape((1, 1, 3)) + mean.reshape((1, 1, 3))
     image = np.clip(image, 0.0, 1.0)
     return (255 * image).astype('uint8')
@@ -236,14 +240,18 @@ def dream(image: torch.Tensor,
           sqrt_normed: bool = False,
           iterations: int = 20,
           lr: float = 1e-2) -> torch.Tensor:
-    """ Updates the (preprocessed, on-device) image to maximize the chosen layer outputs for n iterations """
+    """
+    Updates the (preprocessed, on-device) image to maximize the chosen layer outputs for n iterations.
+    Batches are supported: the loss and the gradient-normalized step are computed per sample,
+    so each image in the batch dreams independently, exactly as if processed alone.
+    """
     image = image.detach().clone().requires_grad_(True)
     for _ in range(iterations):
         out = model.get_layers_features(image, layers=layers, channels=channels, normed=normed, sqrt_normed=sqrt_normed)
-        loss = sum(layer.norm() for layer in out)                   # More than one layer may be used
+        loss = sum(layer.flatten(1).norm(dim=1).sum() for layer in out)  # Per-sample norm; more than one layer may be used
         loss.backward()
         with torch.no_grad():
-            avg_grad = image.grad.abs().mean()
+            avg_grad = image.grad.abs().mean(dim=(1, 2, 3), keepdim=True)
             image += lr / (avg_grad + 1e-12) * image.grad
             image.copy_(clip(image))
             image.grad.zero_()
@@ -530,6 +538,8 @@ def style_transfer_discriminator(
 @click.option('--num-octaves', type=int, help='Number of octaves', default=5, show_default=True)
 @click.option('--octave-scale', type=float, help='Image scale between octaves', default=1.4, show_default=True)
 @click.option('--unzoom-octave', type=bool, help='Set to True for the octaves to be unzoomed (this will be slower)', default=True, show_default=True)
+# Performance options
+@click.option('--batch-size', type=click.IntRange(min=1), help='Number of seeds to dream per forward pass (ignored when --layers=all)', default=1, show_default=True)
 # Extra parameters for saving the results
 @click.option('--outdir', type=click.Path(file_okay=False), help='Directory path to save the results', default=os.path.join(os.getcwd(), 'out', 'discriminator_synthesis'), show_default=True, metavar='DIR')
 @click.option('--description', '-desc', type=str, help='Additional description name for the directory path to save results', default='', show_default=True)
@@ -551,6 +561,7 @@ def discriminator_dream(
         num_octaves: int,
         octave_scale: float,
         unzoom_octave: bool,
+        batch_size: int,
         outdir: Union[str, os.PathLike],
         description: str,
 ):
@@ -639,28 +650,46 @@ def discriminator_dream(
         desc = f'{desc}-{description}' if len(description) != 0 else desc
         run_dir = gen_utils.make_run_dir(outdir, desc)
 
+        if batch_size > 1 and {'b4_mbstd', 'b4_conv', 'fc', 'out'}.intersection(layers):
+            print('Note: layers past b4_mbstd use minibatch statistics, so results with --batch-size > 1 '
+                  'will differ slightly from running one seed at a time.')
+
         starting_images, used_seeds = [], []
-        for seed in seeds:
-            # Get the image and image name
-            image, starting_image = get_image(seed=seed, image_noise=image_noise,
-                                              starting_image=starting_image,
-                                              image_size=model_resolution,
-                                              convert_to_grayscale=convert_to_grayscale)
+        for chunk_start in range(0, len(seeds), batch_size):
+            chunk_seeds = seeds[chunk_start:chunk_start + batch_size]
 
-            # Extract deep dream image
-            dreamed_image = deep_dream(image, model, model_resolution, layers=layers, channels=channels, seed=seed, normed=norm_model_layers,
-                                       sqrt_normed=sqrt_norm_model_layers, iterations=iterations, lr=learning_rate,
-                                       octave_scale=octave_scale, num_octaves=num_octaves, unzoom_octave=unzoom_octave)
+            # Get the images and image names for this batch of seeds
+            images, image_names = [], []
+            for seed in chunk_seeds:
+                image, starting_image = get_image(seed=seed, image_noise=image_noise,
+                                                  starting_image=starting_image,
+                                                  image_size=model_resolution,
+                                                  convert_to_grayscale=convert_to_grayscale)
+                images.append(image)
+                image_names.append(starting_image)
+                starting_image = None
 
-            # For logging later
-            starting_images.append(starting_image)
-            used_seeds.append(seed)
+            # Extract deep dream images, the whole batch in one pass (get_image already returns
+            # model_resolution squares, so the initial crop/resize transform is a no-op)
+            batch = torch.stack([preprocess(image) for image in images])
+            dreamed_images = deep_dream(batch, model, model_resolution, layers=layers, channels=channels,
+                                        seed=chunk_seeds[0] if len(chunk_seeds) == 1 else chunk_seeds,
+                                        normed=norm_model_layers, sqrt_normed=sqrt_norm_model_layers,
+                                        iterations=iterations, lr=learning_rate, octave_scale=octave_scale,
+                                        num_octaves=num_octaves, unzoom_octave=unzoom_octave,
+                                        ignore_initial_transform=True)
+            if dreamed_images.ndim == 3:
+                dreamed_images = dreamed_images[None]
 
-            # Save the resulting image and initial image
-            filename = f'dreamed_{os.path.basename(starting_image)}'
-            Image.fromarray(dreamed_image).save(os.path.join(run_dir, filename))
-            image.save(os.path.join(run_dir, os.path.basename(starting_image)))
-            starting_image = None
+            for image, image_name, seed, dreamed_image in zip(images, image_names, chunk_seeds, dreamed_images):
+                # For logging later
+                starting_images.append(image_name)
+                used_seeds.append(seed)
+
+                # Save the resulting image and initial image
+                filename = f'dreamed_{os.path.basename(image_name)}'
+                Image.fromarray(dreamed_image).save(os.path.join(run_dir, filename))
+                image.save(os.path.join(run_dir, os.path.basename(image_name)))
 
         # Save the configuration used
         ctx.obj = {
@@ -680,6 +709,8 @@ def discriminator_dream(
                 'octave_scale': octave_scale,
                 'num_octaves': num_octaves,
                 'unzoom_octave': unzoom_octave},
+            'performance_options': {
+                'batch_size': batch_size},
             'extra_parameters': {
                 'outdir': run_dir,
                 'description': description}
@@ -1203,6 +1234,74 @@ def random_interpolation(
 # ----------------------------------------------------------------------------
 
 
+def _slice_volume(volume: np.ndarray, axis: str) -> np.ndarray:
+    """Reorder a (T, H, W, C) volume so the first dimension indexes slices perpendicular to `axis`"""
+    if axis == 't':
+        return volume                          # (T, H, W, C): xy planes
+    elif axis == 'y':
+        return volume.transpose(1, 0, 2, 3)    # (H, T, W, C): tx planes
+    return volume.transpose(2, 0, 1, 3)        # (W, T, H, C): ty planes
+
+
+def _dream_video_worker(rank: int, num_gpus: int, volume_path: str, run_dir: str, opts: dict) -> None:
+    """
+    Worker for (multi-GPU) dream-video generation. Worker `rank` loads the Discriminator on
+    GPU `rank`, memory-maps the shared noise volume, and dreams the slice indices
+    rank, rank + num_gpus, rank + 2*num_gpus, ... of every requested axis, `batch_size`
+    slices per forward pass. Frames are named by their global slice index, so the parent
+    can assemble the videos once all workers have finished.
+    """
+    device = torch.device('cuda', rank) if torch.cuda.is_available() else torch.device('cpu')
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+
+    D = gen_utils.load_network('D', opts['network_pkl'], opts['cfg'], device)
+    model = DiscriminatorFeatures(D).requires_grad_(False).to(device)
+
+    # Memory-map the volume so each worker only reads the slices it needs
+    volume = np.load(volume_path, mmap_mode='r')
+    batch_size = opts['batch_size']
+
+    for axis in opts['axes']:
+        slices = _slice_volume(volume, axis)
+        axis_dir = os.path.join(run_dir, f'axis_{axis}')
+        n_digits = int(np.log10(len(slices))) + 1
+        indices = list(range(rank, len(slices), num_gpus))
+
+        pbar = tqdm(total=len(indices), desc=f'GPU {rank}: dreaming along the {axis}-axis',
+                    unit='frame', position=rank)
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start:start + batch_size]
+            # Preprocess each slice and tile it up to a Discriminator-friendly size
+            # (np.array copies the slice out of the read-only memory map)
+            tensors = []
+            for i in batch_indices:
+                slice_tensor = preprocess(np.array(slices[i]))
+                slice_tensor, (h, w) = pad_to_multiple(slice_tensor, opts['multiple'])
+                tensors.append(slice_tensor)
+            batch = torch.stack(tensors)
+
+            dreamed = deep_dream(
+                batch, model, opts['model_resolution'],
+                layers=opts['layers'], channels=opts['channels'], seed=None,
+                normed=opts['norm_model_layers'], sqrt_normed=opts['sqrt_norm_model_layers'],
+                iterations=opts['iterations'], lr=opts['learning_rate'],
+                octave_scale=opts['octave_scale'], num_octaves=opts['num_octaves'],
+                unzoom_octave=opts['unzoom_octave'],
+                disable_inner_tqdm=True,
+                ignore_initial_transform=True
+            )
+            if dreamed.ndim == 3:
+                dreamed = dreamed[None]
+
+            for j, i in enumerate(batch_indices):
+                # Crop back to the slice size (made even, as yuv420p requires even dimensions)
+                frame = dreamed[j][:h - h % 2, :w - w % 2]
+                Image.fromarray(frame).save(os.path.join(axis_dir, f'frame_{i:0{n_digits}d}.jpg'))
+            pbar.update(len(batch_indices))
+        pbar.close()
+
+
 def combine_axis_videos(video_paths: List[Union[str, os.PathLike]],
                         out_path: Union[str, os.PathLike],
                         height: int = 512) -> None:
@@ -1239,6 +1338,9 @@ def combine_axis_videos(video_paths: List[Union[str, os.PathLike]],
 @click.option('--img-size', type=click.IntRange(min=8), help='Size of the noise volume along the y and x axes (None = Discriminator resolution)', default=None)
 @click.option('--noise-octaves', type=click.IntRange(min=1), help='Number of fractal octaves for the Perlin noise', default=6, show_default=True)
 @click.option('--loop', is_flag=True, help='Make the noise periodic in time, so the t-axis video loops seamlessly')
+# Performance options
+@click.option('--gpus', type=click.IntRange(min=1), help='Number of GPUs to split the slices across (1 process per GPU)', default=1, show_default=True)
+@click.option('--batch-size', type=click.IntRange(min=1), help='Number of slices to dream per forward pass on each GPU', default=1, show_default=True)
 # Video options
 @click.option('--fps', type=gen_utils.parse_fps, help='FPS for the output videos', default=25, show_default=True)
 @click.option('--combine', type=bool, help='Stack the axis videos side by side into a single comparison video', default=True, show_default=True)
@@ -1267,6 +1369,8 @@ def discriminator_dream_video(
         img_size: Optional[int],
         noise_octaves: int,
         loop: bool,
+        gpus: int,
+        batch_size: int,
         fps: int,
         combine: bool,
         display_height: int,
@@ -1284,13 +1388,25 @@ def discriminator_dream_video(
 
     Non-square slices are tiled up to a Discriminator-friendly size, dreamed, and
     cropped back, so the volume dimensions do not need to match the model resolution.
-    """
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    # Load Discriminator
-    D = gen_utils.load_network('D', network_pkl, cfg, device)
+    Slices are independent of each other, so the work can be split across GPUs
+    (--gpus N spawns one worker process per GPU) and batched (--batch-size B dreams
+    B slices per forward pass); both are exactly equivalent to the sequential result,
+    except for layers past b4_mbstd, whose minibatch statistics depend on the batch.
+    """
+    # Number of worker processes/GPUs
+    if torch.cuda.is_available():
+        available_gpus = torch.cuda.device_count()
+        if gpus > available_gpus:
+            print(f'Requested {gpus} GPUs, but only {available_gpus} are visible; using {available_gpus}.')
+        num_gpus = min(gpus, available_gpus)
+    else:
+        num_gpus = 1
+
+    # Load the Discriminator on the CPU just to get its resolution; the workers load it on their own GPUs
+    D = gen_utils.load_network('D', network_pkl, cfg, torch.device('cpu'))
     model_resolution = D.img_resolution
-    model = DiscriminatorFeatures(D).requires_grad_(False).to(device)
+    del D
 
     # Parse layers
     layers = layers.split(',')
@@ -1300,6 +1416,10 @@ def discriminator_dream_video(
         available_layers = get_available_layers(max_resolution=model_resolution)
         layers = [layer for layer in layers if layer in available_layers]
     assert len(layers) > 0, f'No valid layers given! Available layers: {get_available_layers(model_resolution)}'
+
+    if batch_size > 1 and {'b4_mbstd', 'b4_conv', 'fc', 'out'}.intersection(layers):
+        print('Note: layers past b4_mbstd use minibatch statistics, so results with --batch-size > 1 '
+              'will differ slightly from running one slice at a time.')
 
     # Parse axes
     axes = [axis.strip() for axis in axes.split(',') if axis.strip()]
@@ -1314,45 +1434,50 @@ def discriminator_dream_video(
     desc = f'discriminator-dream-video-axes_{"-".join(axes)}'
     desc = f'{desc}-{description}' if description else desc
     run_dir = gen_utils.make_run_dir(outdir, desc)
+    for axis in axes:
+        os.makedirs(os.path.join(run_dir, f'axis_{axis}'), exist_ok=True)
 
+    # Generate the noise volume once and share it with the workers via a memory-mapped file
     print(f'Generating a ({num_frames}, {img_size}, {img_size}) 3D Perlin noise volume...')
-    volume = get_perlin_volume(seed, num_frames, img_size, convert_to_grayscale, device, loop, noise_octaves)
+    noise_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    volume = get_perlin_volume(seed, num_frames, img_size, convert_to_grayscale, noise_device, loop, noise_octaves)
+    volume_path = os.path.join(run_dir, 'perlin_volume.npy')
+    np.save(volume_path, volume)
+    del volume
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
+    worker_opts = {
+        'network_pkl': network_pkl,
+        'cfg': cfg,
+        'model_resolution': model_resolution,
+        'layers': layers,
+        'channels': channels,
+        'norm_model_layers': norm_model_layers,
+        'sqrt_norm_model_layers': sqrt_norm_model_layers,
+        'iterations': iterations,
+        'learning_rate': learning_rate,
+        'octave_scale': octave_scale,
+        'num_octaves': num_octaves,
+        'unzoom_octave': unzoom_octave,
+        'axes': axes,
+        'multiple': multiple,
+        'batch_size': batch_size,
+    }
+
+    if num_gpus > 1:
+        print(f'Splitting the slices across {num_gpus} GPUs ({batch_size} slice(s) per forward pass each)...')
+        torch.multiprocessing.spawn(_dream_video_worker, args=(num_gpus, volume_path, run_dir, worker_opts),
+                                    nprocs=num_gpus, join=True)
+    else:
+        _dream_video_worker(0, 1, volume_path, run_dir, worker_opts)
+
+    # Assemble one video per axis from the saved frames
     axis_videos = []
     for axis in axes:
-        # Slice the volume perpendicular to the chosen axis; first dim indexes the slices
-        if axis == 't':
-            slices = volume                              # (T, H, W, C): xy planes
-        elif axis == 'y':
-            slices = volume.transpose(1, 0, 2, 3)        # (H, T, W, C): tx planes
-        else:
-            slices = volume.transpose(2, 0, 1, 3)        # (W, T, H, C): ty planes
-
+        num_slices = num_frames if axis == 't' else img_size
+        n_digits = int(np.log10(num_slices)) + 1
         axis_dir = os.path.join(run_dir, f'axis_{axis}')
-        os.makedirs(axis_dir, exist_ok=True)
-        n_digits = int(np.log10(len(slices))) + 1
-
-        for idx, slice_np in enumerate(tqdm(slices, desc=f'Dreaming along the {axis}-axis', unit='frame')):
-            # Preprocess the slice and tile it up to a Discriminator-friendly size
-            slice_tensor = preprocess(np.ascontiguousarray(slice_np))
-            slice_tensor, (h, w) = pad_to_multiple(slice_tensor, multiple)
-
-            dreamed_frame = deep_dream(
-                slice_tensor, model, model_resolution,
-                layers=layers, channels=channels, seed=None,
-                normed=norm_model_layers, sqrt_normed=sqrt_norm_model_layers,
-                iterations=iterations, lr=learning_rate,
-                octave_scale=octave_scale, num_octaves=num_octaves,
-                unzoom_octave=unzoom_octave,
-                disable_inner_tqdm=True,
-                ignore_initial_transform=True
-            )
-
-            # Crop back to the slice size (made even, as yuv420p requires even dimensions)
-            dreamed_frame = dreamed_frame[:h - h % 2, :w - w % 2]
-            filename = f'frame_{idx:0{n_digits}d}.jpg'
-            Image.fromarray(dreamed_frame).save(os.path.join(axis_dir, filename))
-
         gen_utils.save_video_from_images(run_dir=axis_dir, image_names=f'frame_%0{n_digits}d.jpg',
                                          video_name=f'dream-video-{axis}_axis', fps=fps, reverse_video=False)
         axis_videos.append(os.path.join(axis_dir, f'dream-video-{axis}_axis.mp4'))
@@ -1392,6 +1517,10 @@ def discriminator_dream_video(
             'fps': fps,
             'combine': combine,
             'display_height': display_height
+        },
+        'performance_options': {
+            'gpus': num_gpus,
+            'batch_size': batch_size
         },
         'extra_parameters': {
             'outdir': run_dir,
