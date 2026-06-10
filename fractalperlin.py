@@ -83,149 +83,87 @@ class FractalPerlin3D(object):
     """
     3D Fractal Perlin Noise generator for smooth video sequences.
 
-    Generates coherent noise across time, perfect for DeepDream-style video synthesis.
-    Each frame is a slice of 3D noise at a specific time coordinate.
+    Proper lattice-based Perlin noise: each octave places random unit gradient
+    vectors on a coarse (t, y, x) lattice and interpolates their dot products
+    with the local offset vectors using the smoothstep fade. Summing octaves
+    with decreasing amplitudes gives the fractal (fBm) result.
+
+    The resulting volume is isotropic, so it can be sliced along any of the
+    three axes (xy, ty, tx planes) and still look like 2D Perlin noise.
 
     Args:
-        shape: Tuple of (channels, height, width) - spatial dimensions
-        resolutions: List of (time_res, height_res, width_res) tuples for each octave
+        shape: Tuple of (channels, height, width); each channel gets an independent noise field
+        resolutions: List of (t_cells, y_cells, x_cells) lattice cells per octave
         factors: List of amplitude factors for each octave
         num_frames: Total number of frames to generate
         generator: PyTorch random generator (for reproducibility)
-        loop: If True, the noise will loop seamlessly
+        loop: If True, the noise is periodic along the time axis (seamless loop)
     """
 
     def __init__(self, shape: Tuple[int, int, int], resolutions: List[Tuple[int, int, int]],
                  factors: List[float], num_frames: int,
                  generator=torch.random.default_generator, loop: bool = True):
-        self.shape = shape if len(shape) == 3 else (None,) + shape  # (C, H, W)
+        shape = shape if len(shape) == 3 else (1,) + tuple(shape)
+        self.channels, self.height, self.width = shape
         self.factors = factors
         self.num_frames = num_frames
         self.generator = generator
         self.device = generator.device
-        self.resolutions = resolutions  # [(t_res, h_res, w_res), ...]
+        self.resolutions = resolutions  # [(t_cells, y_cells, x_cells), ...]
         self.loop = loop
 
-        # Grid shapes for each octave
-        self.grid_shapes = [
-            (num_frames // res[0] if loop else num_frames,
-             shape[1] // res[1],
-             shape[2] // res[2])
-            for res in resolutions
-        ]
-
-        # Precompute interpolation grids for each octave
-        self.setup_interpolation_grids()
-
-    def setup_interpolation_grids(self):
-        """Precompute interpolation grids for efficient noise generation."""
-        self.lint_grids = []
-        self.liny_grids = []
-        self.linx_grids = []
-        self.masks = []
-
-        for octave, (tres, hres, wres) in enumerate(self.resolutions):
-            gs = self.grid_shapes[octave]
-
-            # Create 1D interpolation vectors
-            if self.loop:
-                # For looping, we tile the time dimension
-                lint = torch.linspace(0, 1, tres, device=self.device)
-                lint = lint.repeat(self.num_frames // tres + 1)[:self.num_frames]
-            else:
-                lint = torch.linspace(0, 1, gs[0], device=self.device)
-
-            liny = torch.linspace(0, 1, gs[1], device=self.device)
-            linx = torch.linspace(0, 1, gs[2], device=self.device)
-
-            self.lint_grids.append(lint)
-            self.liny_grids.append(liny)
-            self.linx_grids.append(linx)
-
-            # Compute 3D fade masks (8 corners of cube)
-            fade_t = self.fade(lint)[:, None, None]
-            fade_y = self.fade(liny)[None, :, None]
-            fade_x = self.fade(linx)[None, None, :]
-
-            # 8 corner masks for trilinear interpolation
-            masks_octave = []
-            for dt in [fade_t, 1 - fade_t]:
-                for dy in [fade_y, 1 - fade_y]:
-                    for dx in [fade_x, 1 - fade_x]:
-                        masks_octave.append(dt * dy * dx)
-            self.masks.append(masks_octave)
-
-    def fade(self, t: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def fade(t: torch.Tensor) -> torch.Tensor:
         """Smoothstep fade function: 6t^5 - 15t^4 + 10t^3"""
         return 6 * t**5 - 15 * t**4 + 10 * t**3
 
     def perlin_noise_3d(self, octave: int) -> torch.Tensor:
-        """Generate 3D Perlin noise for a specific octave."""
-        tres, hres, wres = self.resolutions[octave]
+        """Generate one octave of 3D Perlin noise; returns a (num_frames, H, W) tensor."""
+        T, H, W = self.num_frames, self.height, self.width
+        ct, cy, cx = self.resolutions[octave]
+        device = self.device
 
-        # Generate random gradient vectors for each grid point
-        # We need (tres+2) x (hres+2) x (wres+2) grid points
-        grid_size = (tres + 2, hres + 2, wres + 2)
+        # Random unit gradient vectors on the (ct+1, cy+1, cx+1) lattice (uniform on the sphere)
+        g_shape = (ct + 1, cy + 1, cx + 1)
+        theta = torch.rand(g_shape, generator=self.generator, device=device) * tau
+        gt = torch.rand(g_shape, generator=self.generator, device=device) * 2 - 1
+        s = torch.sqrt(torch.clamp(1 - gt**2, min=0.0))
+        grads = torch.stack((s * torch.cos(theta), s * torch.sin(theta), gt), dim=-1)  # (..., [gx, gy, gt])
+        if self.loop:
+            grads[-1] = grads[0]  # Periodic along time => seamless loop
 
-        # Random angles for gradient vectors (simplified 3D gradients)
-        theta = torch.zeros(grid_size, device=self.device).uniform_(0, tau, generator=self.generator)
-        phi = torch.zeros(grid_size, device=self.device).uniform_(0, np.pi, generator=self.generator)
+        # Voxel coordinates in lattice space: cell index + fractional position
+        tc = torch.arange(T, device=device, dtype=torch.float32) * (ct / T)
+        yc = torch.arange(H, device=device, dtype=torch.float32) * (cy / H)
+        xc = torch.arange(W, device=device, dtype=torch.float32) * (cx / W)
+        y0 = yc.long().clamp_(max=cy - 1)
+        x0 = xc.long().clamp_(max=cx - 1)
+        fy = (yc - y0).view(1, H, 1)
+        fx = (xc - x0).view(1, 1, W)
+        wy, wx = self.fade(fy), self.fade(fx)
 
-        # Convert spherical to Cartesian coordinates
-        grad_x = torch.sin(phi) * torch.cos(theta)
-        grad_y = torch.sin(phi) * torch.sin(theta)
-        grad_z = torch.cos(phi)
-
-        # Interpolation grid positions
-        lint = self.lint_grids[octave]
-        liny = self.liny_grids[octave]
-        linx = self.linx_grids[octave]
-
-        # Create distance vectors for each corner
-        # This is a simplified implementation - full 3D Perlin is more complex
-        # but this gives us smooth, coherent noise across time
-
-        # Generate gradients at corners
-        gradients = []
-        for t_idx in range(2):
-            for y_idx in range(2):
-                for x_idx in range(2):
-                    gx = grad_x[t_idx:t_idx+tres, y_idx:y_idx+hres, x_idx:x_idx+wres]
-                    gy = grad_y[t_idx:t_idx+tres, y_idx:y_idx+hres, x_idx:x_idx+wres]
-                    gz = grad_z[t_idx:t_idx+tres, y_idx:y_idx+hres, x_idx:x_idx+wres]
-
-                    # Dot product with distance vectors
-                    if t_idx == 0:
-                        dt = lint[:, None, None]
-                    else:
-                        dt = lint[:, None, None] - 1
-
-                    if y_idx == 0:
-                        dy = liny[None, :, None]
-                    else:
-                        dy = liny[None, :, None] - 1
-
-                    if x_idx == 0:
-                        dx = linx[None, None, :]
-                    else:
-                        dx = linx[None, None, :] - 1
-
-                    # Ensure proper broadcasting
-                    gx_exp = gx[:lint.shape[0], :liny.shape[0], :linx.shape[0]]
-                    gy_exp = gy[:lint.shape[0], :liny.shape[0], :linx.shape[0]]
-                    gz_exp = gz[:lint.shape[0], :liny.shape[0], :linx.shape[0]]
-
-                    dot = gx_exp * dx + gy_exp * dy + gz_exp * dt
-                    gradients.append(dot)
-
-        # Trilinear interpolation using precomputed masks
-        noise = torch.zeros((self.num_frames, self.shape[1], self.shape[2]), device=self.device)
-        for mask, gradient in zip(self.masks[octave], gradients):
-            # Crop gradient to match noise dimensions
-            grad_crop = gradient[:self.num_frames, :self.shape[1], :self.shape[2]]
-            mask_crop = mask[:self.num_frames, :self.shape[1], :self.shape[2]]
-            noise += mask_crop * grad_crop
-
+        noise = torch.empty((T, H, W), device=device)
+        # Chunk along time to bound the memory of the (chunk, H, W, 3) gradient gathers
+        chunk = max(1, 2**22 // (H * W))
+        for start in range(0, T, chunk):
+            ts = tc[start:start + chunk]
+            t0 = ts.long().clamp_(max=ct - 1)
+            ft = (ts - t0).view(-1, 1, 1)
+            wt = self.fade(ft)
+            acc = torch.zeros((len(ts), H, W), device=device)
+            # Trilinear interpolation of the 8 corner gradient dot products
+            for dt in (0, 1):
+                w_t = wt if dt else 1 - wt
+                idx_t = (t0 + dt).view(-1, 1, 1)
+                for dy in (0, 1):
+                    w_ty = w_t * (wy if dy else 1 - wy)
+                    idx_y = (y0 + dy).view(1, -1, 1)
+                    for dx in (0, 1):
+                        weight = w_ty * (wx if dx else 1 - wx)
+                        g = grads[idx_t, idx_y, (x0 + dx).view(1, 1, -1)]  # (chunk, H, W, 3)
+                        dot = g[..., 0] * (fx - dx) + g[..., 1] * (fy - dy) + g[..., 2] * (ft - dt)
+                        acc += weight * dot
+            noise[start:start + chunk] = acc
         return noise
 
     def __call__(self) -> torch.Tensor:
@@ -233,23 +171,16 @@ class FractalPerlin3D(object):
         Generate 3D fractal Perlin noise.
 
         Returns:
-            Tensor of shape (num_frames, C, H, W) - a video sequence
+            Tensor of shape (num_frames, C, H, W) - a video sequence,
+            with an independent noise field per channel
         """
-        # Initialize with zeros
-        noise = torch.zeros((self.num_frames, self.shape[1], self.shape[2]), device=self.device)
-
-        # Sum octaves with their respective factors
-        for octave, factor in enumerate(self.factors):
-            noise += factor * self.perlin_noise_3d(octave)
-
-        # Expand to include channel dimension if needed
-        if self.shape[0] is not None and self.shape[0] > 1:
-            # Replicate for each channel (RGB)
-            noise = noise.unsqueeze(1).expand(-1, self.shape[0], -1, -1)
-        else:
-            noise = noise.unsqueeze(1)
-
-        return noise  # (num_frames, C, H, W)
+        channels = []
+        for _ in range(self.channels):
+            noise = torch.zeros((self.num_frames, self.height, self.width), device=self.device)
+            for octave, factor in enumerate(self.factors):
+                noise += factor * self.perlin_noise_3d(octave)
+            channels.append(noise)
+        return torch.stack(channels, dim=1)  # (num_frames, C, H, W)
 
 
 # Convenience functions
@@ -260,45 +191,58 @@ def get_2d_perlin(shape: Tuple[int, int, int], seed: int = 0,
     Generate 2D fractal Perlin noise with default parameters.
 
     Args:
-        shape: (C, H, W) tuple
+        shape: (C, H, W) tuple; each channel gets an independent noise field
         seed: Random seed
         device: Device to generate on ('cuda' or 'cpu')
-        lacunarity: Frequency multiplier between octaves (default 2.0)
+        lacunarity: Frequency multiplier between octaves (currently fixed at 2.0,
+                    as FractalPerlin2D requires H and W to be divisible by the cell counts)
         persistence: Amplitude multiplier between octaves (default 0.5)
-        octaves: Number of octaves to sum
+        octaves: Number of octaves to sum (clamped so the finest lattice fits the image)
 
     Returns:
-        Tensor of shape (1, C, H, W) with values in range [-1, 1]
+        Tensor of shape (C, H, W) with values approximately in [-1, 1]
     """
+    # The finest lattice (2**octaves cells) must divide the image size
+    octaves = min(octaves, int(np.log2(min(shape[1], shape[2]))))
     resolutions = [(2**i, 2**i) for i in range(1, octaves + 1)]
     factors = [persistence**i for i in range(octaves)]
     g = torch.Generator(device=device).manual_seed(seed)
-    noise = FractalPerlin2D(shape, resolutions, factors, generator=g)(batch_size=1)
+    noise = FractalPerlin2D(shape, resolutions, factors, generator=g)()  # batch dim = channels
     return noise
 
 
 def get_3d_perlin(shape: Tuple[int, int, int], num_frames: int, seed: int = 0,
                   device: str = 'cuda', lacunarity: float = 2.0,
                   persistence: float = 0.5, octaves: int = 6,
-                  loop: bool = True) -> torch.Tensor:
+                  loop: bool = True, isotropic: bool = True) -> torch.Tensor:
     """
     Generate 3D fractal Perlin noise for video sequences.
 
     Args:
-        shape: (C, H, W) tuple for spatial dimensions
+        shape: (C, H, W) tuple for spatial dimensions; each channel is an independent field
         num_frames: Number of frames to generate
         seed: Random seed
         device: Device to generate on ('cuda' or 'cpu')
         lacunarity: Frequency multiplier between octaves (default 2.0)
         persistence: Amplitude multiplier between octaves (default 0.5)
         octaves: Number of octaves to sum
-        loop: If True, the video will loop seamlessly
+        loop: If True, the video will loop seamlessly (periodic along time)
+        isotropic: If True, scale the time-axis cell count by num_frames / max(H, W),
+                   so a lattice cell spans the same "world distance" along every axis;
+                   this makes slices along t, y, and x statistically equivalent
 
     Returns:
-        Tensor of shape (num_frames, C, H, W) with values in range [-1, 1]
+        Tensor of shape (num_frames, C, H, W) with values approximately in [-1, 1]
     """
-    # Resolutions include time dimension
-    resolutions = [(2**i, 2**i, 2**i) for i in range(1, octaves + 1)]
+    T = num_frames
+    S = max(shape[1], shape[2])
+    resolutions = []
+    for i in range(octaves):
+        cells = 2 * lacunarity**i
+        cy = max(1, min(round(cells), shape[1]))
+        cx = max(1, min(round(cells), shape[2]))
+        ct = max(1, round(cells * T / S)) if isotropic else max(1, min(round(cells), T))
+        resolutions.append((ct, cy, cx))
     factors = [persistence**i for i in range(octaves)]
     g = torch.Generator(device=device).manual_seed(seed)
     noise = FractalPerlin3D(shape, resolutions, factors, num_frames, generator=g, loop=loop)()

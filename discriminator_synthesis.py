@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 from torchvision import transforms
 
 import PIL
@@ -12,10 +11,10 @@ try:
 except ImportError:
     raise ImportError('ffmpeg-python not found! Install it via "pip install ffmpeg-python"')
 
-import scipy.ndimage as nd
 import numpy as np
 
 import os
+import shutil
 import click
 from typing import Union, Tuple, Optional, List, Type
 from tqdm import tqdm
@@ -86,11 +85,12 @@ def get_image(seed: int = 0,
             image = Image.fromarray(rnd.randint(0, 255, (image_size, image_size, 3), dtype='uint8'))
         elif image_noise == 'perlin':
             starting_image = f'perlin_image-seed_{seed:08d}.jpg'
-            # Use our local fractalperlin implementation
-            shape = (3, image_size, image_size)
-            noise = get_2d_perlin(shape, seed=seed, device=device, octaves=6)
-            rgb = (255 * (noise[0].cpu().numpy() + 1) / 2).astype(np.uint8)  # [-1, 1] → [0, 255]
-            image = Image.fromarray(rgb.transpose(1, 2, 0), 'RGB')
+            # Use our local fractalperlin implementation; one independent noise field per RGB channel
+            noise = get_2d_perlin((3, image_size, image_size), seed=seed, device=device, octaves=6)
+            noise = noise.cpu().numpy()
+            # Stretch to the full [0, 255] range (raw fractal Perlin rarely reaches +-1)
+            noise = (noise - noise.min()) / (np.ptp(noise) + 1e-8)
+            image = Image.fromarray((255 * noise).astype(np.uint8).transpose(1, 2, 0), 'RGB')
 
     if convert_to_grayscale:
         image = image.convert('L').convert('RGB')
@@ -98,38 +98,76 @@ def get_image(seed: int = 0,
     return image, starting_image
 
 
-def get_perlin_video(seed: int,
-                     num_frames: int,
-                     image_size: int,
-                     convert_to_grayscale: bool = False,
-                     device: torch.device = torch.device('cuda'),
-                     loop: bool = True) -> Tuple[torch.Tensor, str]:
+def get_perlin_volume(seed: int,
+                      num_frames: int,
+                      image_size: int,
+                      convert_to_grayscale: bool = False,
+                      device: torch.device = torch.device('cuda'),
+                      loop: bool = True,
+                      octaves: int = 6) -> np.ndarray:
     """
-    Generate a video sequence using 3D fractal Perlin noise.
+    Generate a 3D fractal Perlin noise volume that can be sliced along any axis.
 
     Args:
         seed: Random seed
-        num_frames: Number of frames to generate
-        image_size: Size of each frame
-        convert_to_grayscale: Convert to grayscale
-        device: Device for generation
-        loop: If True, video loops seamlessly
+        num_frames: Size of the volume along the time axis
+        image_size: Size of the volume along the y and x axes
+        convert_to_grayscale: Use a single noise field for all three channels
+        device: Device for generation (the volume is returned on CPU)
+        loop: If True, the volume is periodic along the time axis (seamless loop)
+        octaves: Number of fractal octaves to sum
 
     Returns:
-        (Tensor of shape [num_frames, 3, H, W], filename prefix)
+        uint8 array of shape (num_frames, image_size, image_size, 3); the min/max
+        are taken over the whole volume so slices stay temporally consistent
     """
-    shape = (1 if convert_to_grayscale else 3, image_size, image_size)
-    noise = get_3d_perlin(shape, num_frames, seed=seed, device=device, octaves=6, loop=loop)
-
-    # Convert from [-1, 1] to [0, 255]
-    frames = ((noise + 1) / 2 * 255).clamp(0, 255).byte()
-
-    # If grayscale, replicate to 3 channels
+    channels = 1 if convert_to_grayscale else 3
+    noise = get_3d_perlin((channels, image_size, image_size), num_frames, seed=seed,
+                          device=device, octaves=octaves, loop=loop)  # (T, C, H, W)
+    noise = noise.cpu().numpy()
+    noise = (noise - noise.min()) / (np.ptp(noise) + 1e-8)
+    volume = (255 * noise).astype(np.uint8).transpose(0, 2, 3, 1)  # (T, H, W, C)
     if convert_to_grayscale:
-        frames = frames.expand(-1, 3, -1, -1)
+        volume = volume.repeat(3, axis=-1)
+    return volume
 
-    filename_prefix = f'perlin3d_video-seed_{seed:08d}-frames_{num_frames}'
-    return frames, filename_prefix
+
+def get_padding_multiple(layers: List[str], max_resolution: int) -> int:
+    """
+    Smallest power of two that each spatial dimension of an input image must be divisible by,
+    so that the requested Discriminator layers can be computed on inputs of arbitrary size
+    (every block halves the resolution, and the skip/conv branches must stay in sync).
+    """
+    max_down = 0
+    for layer in layers:
+        match = re.match(r'b(\d+)_conv(\d)', layer)
+        if layer == 'from_rgb':
+            down = 0
+        elif match and int(match.group(1)) > 4:
+            res = int(match.group(1))
+            down = int(np.log2(max_resolution // res)) + (1 if match.group(2) == '1' else 0)
+        else:  # 'b4_mbstd', 'b4_conv', 'fc', 'out' traverse the full network
+            down = int(np.log2(max_resolution // 4))
+        max_down = max(max_down, down)
+    return 2 ** max_down
+
+
+def pad_to_multiple(image: torch.Tensor, multiple: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """
+    Tile a (C, H, W) or (B, C, H, W) tensor along its bottom/right edges so both spatial
+    dimensions are multiples of `multiple`. Tiling (rather than zero-padding) keeps the
+    statistics of the noise, and is seamless along a looping Perlin time axis.
+
+    Returns the padded tensor and the original (H, W) to crop the result back.
+    """
+    h, w = image.shape[-2:]
+    new_h = -(-h // multiple) * multiple
+    new_w = -(-w // multiple) * multiple
+    if (new_h, new_w) != (h, w):
+        reps = [1] * image.dim()
+        reps[-2], reps[-1] = -(-new_h // h), -(-new_w // w)
+        image = image.repeat(*reps)[..., :new_h, :new_w]
+    return image, (h, w)
 
 
 def crop_resize_rotate(img: PIL.Image.Image,
@@ -161,55 +199,58 @@ def crop_resize_rotate(img: PIL.Image.Image,
     return img
 
 
-mean = np.array([0.485, 0.456, 0.406])
-std = np.array([0.229, 0.224, 0.225])
+# StyleGAN's Discriminator is fed images in [-1, 1], so we normalize with mean = std = 0.5
+# (the previous ImageNet statistics are a VGG/DeepDream legacy and don't match D's training data)
+mean = np.array([0.5, 0.5, 0.5])
+std = np.array([0.5, 0.5, 0.5])
 
 preprocess = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean, std)])
 
+# Per-channel bounds in normalized space (the [0, 1] image range maps to these)
+_clip_min = torch.as_tensor((0.0 - mean) / std, dtype=torch.float32).view(1, -1, 1, 1)
+_clip_max = torch.as_tensor((1.0 - mean) / std, dtype=torch.float32).view(1, -1, 1, 1)
 
-def deprocess(image_np: torch.Tensor) -> np.ndarray:
-    image_np = image_np.squeeze().transpose(1, 2, 0)
-    image_np = image_np * std.reshape((1, 1, 3)) + mean.reshape((1, 1, 3))
-    # image_np = (image_np + 1.0) / 2.0
-    image_np = np.clip(image_np, 0.0, 1.0)
-    image_np = (255 * image_np).astype('uint8')
-    return image_np
+
+def deprocess(image: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
+    """Undo the preprocessing normalization and return a uint8 HWC image"""
+    if torch.is_tensor(image):
+        image = image.detach().cpu().numpy()
+    image = image.squeeze().transpose(1, 2, 0)
+    image = image * std.reshape((1, 1, 3)) + mean.reshape((1, 1, 3))
+    image = np.clip(image, 0.0, 1.0)
+    return (255 * image).astype('uint8')
 
 
 def clip(image_tensor: torch.Tensor) -> torch.Tensor:
-    """Clamp per channel"""
-    for c in range(3):
-        m, s = mean[c], std[c]
-        image_tensor[0, c] = torch.clamp(image_tensor[0, c], -m / s, (1 - m) / s)
-    return image_tensor
+    """Clamp per channel to the valid (normalized) image range; vectorized, stays on device"""
+    lo = _clip_min.to(image_tensor.device)
+    hi = _clip_max.to(image_tensor.device)
+    return torch.min(torch.max(image_tensor, lo), hi)
 
 
-def dream(image: PIL.Image.Image,
+def dream(image: torch.Tensor,
           model: torch.nn.Module,
           layers: List[str],
           channels: List[int] = None,
           normed: bool = False,
           sqrt_normed: bool = False,
           iterations: int = 20,
-          lr: float = 1e-2) -> np.ndarray:
-    """ Updates the image to maximize outputs for n iterations """
-    Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
-    image = Variable(Tensor(image), requires_grad=True)
-    for i in range(iterations):
-        model.zero_grad()
+          lr: float = 1e-2) -> torch.Tensor:
+    """ Updates the (preprocessed, on-device) image to maximize the chosen layer outputs for n iterations """
+    image = image.detach().clone().requires_grad_(True)
+    for _ in range(iterations):
         out = model.get_layers_features(image, layers=layers, channels=channels, normed=normed, sqrt_normed=sqrt_normed)
         loss = sum(layer.norm() for layer in out)                   # More than one layer may be used
         loss.backward()
-        avg_grad = np.abs(image.grad.data.cpu().numpy()).mean()
-        norm_lr = lr / avg_grad
-        image.data += norm_lr * image.grad.data
-        image.data = clip(image.data)
-        # image.data = torch.clamp(image.data, -1.0, 1.0)
-        image.grad.data.zero_()
-    return image.cpu().data.numpy()
+        with torch.no_grad():
+            avg_grad = image.grad.abs().mean()
+            image += lr / (avg_grad + 1e-12) * image.grad
+            image.copy_(clip(image))
+            image.grad.zero_()
+    return image.detach()
 
 
-def deep_dream(image: PIL.Image.Image,
+def deep_dream(image: Union[PIL.Image.Image, torch.Tensor],
                model: torch.nn.Module,
                model_resolution: int,
                layers: List[str],
@@ -224,35 +265,42 @@ def deep_dream(image: PIL.Image.Image,
                unzoom_octave: bool = False,
                disable_inner_tqdm: bool = False,
                ignore_initial_transform: bool = False) -> np.ndarray:
-    """ Main deep dream method """
-    # Center-crop and resize
-    if not ignore_initial_transform:
-        image = crop_resize_rotate(img=image, crop_size=min(image.size), new_size=model_resolution)
-    # Preprocess image
-    image = preprocess(image)
-    # image = torch.from_numpy(np.array(image)).permute(-1, 0, 1) / 127.5 - 1.0  # alternative
-    image = image.unsqueeze(0).cpu().data.numpy()
-    # Extract image representations for each octave
+    """
+    Main deep dream method. `image` can be a PIL.Image (which will be preprocessed) or an
+    already-preprocessed tensor of shape (C, H, W) or (1, C, H, W) in normalized [-1, 1] space.
+    Everything runs on the model's device; the only CPU transfer is the final deprocessed result.
+    """
+    device = next(model.parameters()).device
+    if isinstance(image, Image.Image):
+        # Center-crop and resize
+        if not ignore_initial_transform:
+            image = crop_resize_rotate(img=image, crop_size=min(image.size), new_size=model_resolution)
+        image = preprocess(image)
+    image = image.detach().to(device)
+    if image.dim() == 3:
+        image = image.unsqueeze(0)
+
+    # Extract image representations for each octave (coarse to fine), on-device
     octaves = [image]
     for _ in range(num_octaves - 1):
-        # Alternatively, see if we get better results with: https://www.tensorflow.org/tutorials/generative/deepdream#taking_it_up_an_octave
-        octave = nd.zoom(octaves[-1], (1, 1, 1 / octave_scale, 1 / octave_scale), order=1)
+        prev = octaves[-1]
+        h, w = prev.shape[-2:]
+        new_size = (max(int(h / octave_scale), 8), max(int(w / octave_scale), 8))
+        octave = F.interpolate(prev, size=new_size, mode='bilinear', align_corners=False)
         # Necessary for StyleGAN's Discriminator, as it cannot handle any image size
         if unzoom_octave:
-            octave = nd.zoom(octave, np.array(octaves[-1].shape) / np.array(octave.shape), order=1)
+            octave = F.interpolate(octave, size=(h, w), mode='bilinear', align_corners=False)
         octaves.append(octave)
 
-    detail = np.zeros_like(octaves[-1])
+    detail = torch.zeros_like(octaves[-1])
     tqdm_desc = f'Dreaming w/layers {"|".join(x for x in layers)}'
     tqdm_desc = f'Seed: {seed} - {tqdm_desc}' if seed is not None else tqdm_desc
-    for octave, octave_base in enumerate(tqdm(octaves[::-1], desc=tqdm_desc, disable=disable_inner_tqdm)):
-        if octave > 0:
+    for octave_idx, octave_base in enumerate(tqdm(octaves[::-1], desc=tqdm_desc, disable=disable_inner_tqdm)):
+        if octave_idx > 0:
             # Upsample detail to new octave dimension
-            detail = nd.zoom(detail, np.array(octave_base.shape) / np.array(detail.shape), order=1)
-        # Add deep dream detail from previous octave to new base
-        input_image = octave_base + detail
-        # Get new deep dream image
-        dreamed_image = dream(input_image, model, layers, channels, normed, sqrt_normed, iterations, lr)
+            detail = F.interpolate(detail, size=octave_base.shape[-2:], mode='bilinear', align_corners=False)
+        # Add deep dream detail from previous octave to new base, and get new deep dream image
+        dreamed_image = dream(octave_base + detail, model, layers, channels, normed, sqrt_normed, iterations, lr)
         # Extract deep dream details
         detail = dreamed_image - octave_base
 
@@ -1149,16 +1197,24 @@ def random_interpolation(
     gen_utils.save_config(ctx=ctx, run_dir=run_dir)
 
     # Generate video
-    print('Saving video...')
-    ffmpeg_command = r'/usr/bin/ffmpeg' if os.name != 'nt' else r'C:\\Ffmpeg\\bin\\ffmpeg.exe'
-    stream = ffmpeg.input(os.path.join(run_dir, f'{image_noise}-interpolation_frame_%0{n_digits}d.jpg'), framerate=fps)
-    stream = ffmpeg.output(stream, os.path.join(run_dir, f'{image_noise}-interpolation.mp4'), crf=20, pix_fmt='yuv420p')
-    ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, cmd=ffmpeg_command)
+    gen_utils.save_video_from_images(run_dir=run_dir, image_names=f'{image_noise}-interpolation_frame_%0{n_digits}d.jpg',
+                                     video_name=f'{image_noise}-interpolation', fps=fps, reverse_video=False)
 
 # ----------------------------------------------------------------------------
 
 
-@main.command(name='dream-video', help='Generate a DeepDream video using 3D fractal Perlin noise for temporal coherence')
+def combine_axis_videos(video_paths: List[Union[str, os.PathLike]],
+                        out_path: Union[str, os.PathLike],
+                        height: int = 512) -> None:
+    """Stack videos side by side (scaled to a common height, trimmed to the shortest one)"""
+    ffmpeg_command = shutil.which('ffmpeg') or 'ffmpeg'
+    streams = [ffmpeg.input(str(p)).filter('scale', -2, height) for p in video_paths]
+    joined = ffmpeg.filter(streams, 'hstack', inputs=len(streams), shortest=1)
+    stream = ffmpeg.output(joined, str(out_path), crf=20, pix_fmt='yuv420p')
+    ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, cmd=ffmpeg_command, overwrite_output=True)
+
+
+@main.command(name='dream-video', help='DeepDream a 3D fractal Perlin noise volume, sliced along the t, y, and/or x axes')
 @click.pass_context
 @click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
 @click.option('--cfg', type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), help='Model base configuration', default=None)
@@ -1173,14 +1229,20 @@ def random_interpolation(
 @click.option('--channels', type=gen_utils.num_range, help='Channel indices to use (None = all)', default=None, show_default=True)
 @click.option('--normed', 'norm_model_layers', is_flag=True, help='Divide features by number of elements')
 @click.option('--sqrt-normed', 'sqrt_norm_model_layers', is_flag=True, help='Divide features by sqrt of number of elements')
-# Octaves options
+# Octaves options (DeepDream image pyramid, not to be confused with the noise octaves)
 @click.option('--num-octaves', type=click.IntRange(min=1), help='Number of octaves', default=5, show_default=True)
 @click.option('--octave-scale', type=float, help='Image scale between octaves', default=1.4, show_default=True)
-@click.option('--unzoom-octave', type=bool, help='Unzoom octaves (slower but works with fixed-size Discriminator)', default=False, show_default=True)
+@click.option('--unzoom-octave', type=bool, help='Unzoom octaves (needed for slices whose size the Discriminator cannot handle)', default=True, show_default=True)
+# Noise volume options
+@click.option('--axes', type=str, help='Comma-separated volume axes to slice along: "t" (xy planes), "y" (tx planes), "x" (ty planes)', default='t,y,x', show_default=True)
+@click.option('--num-frames', type=click.IntRange(min=1), help='Size of the noise volume along the time axis', default=100, show_default=True)
+@click.option('--img-size', type=click.IntRange(min=8), help='Size of the noise volume along the y and x axes (None = Discriminator resolution)', default=None)
+@click.option('--noise-octaves', type=click.IntRange(min=1), help='Number of fractal octaves for the Perlin noise', default=6, show_default=True)
+@click.option('--loop', is_flag=True, help='Make the noise periodic in time, so the t-axis video loops seamlessly')
 # Video options
-@click.option('--num-frames', type=click.IntRange(min=1), help='Number of frames to generate', default=100, show_default=True)
-@click.option('--loop', is_flag=True, help='Make video loop seamlessly')
-@click.option('--fps', type=gen_utils.parse_fps, help='FPS for the output video', default=25, show_default=True)
+@click.option('--fps', type=gen_utils.parse_fps, help='FPS for the output videos', default=25, show_default=True)
+@click.option('--combine', type=bool, help='Stack the axis videos side by side into a single comparison video', default=True, show_default=True)
+@click.option('--display-height', type=click.IntRange(min=64), help='Height of the combined comparison video', default=512, show_default=True)
 # Extra parameters
 @click.option('--outdir', type=click.Path(file_okay=False), help='Output directory', default=os.path.join(os.getcwd(), 'out', 'discriminator_synthesis'), show_default=True, metavar='DIR')
 @click.option('--description', '-desc', type=str, help='Additional description for output directory', default='', show_default=True)
@@ -1200,17 +1262,28 @@ def discriminator_dream_video(
         num_octaves: int,
         octave_scale: float,
         unzoom_octave: bool,
+        axes: str,
         num_frames: int,
+        img_size: Optional[int],
+        noise_octaves: int,
         loop: bool,
         fps: int,
+        combine: bool,
+        display_height: int,
         outdir: Union[str, os.PathLike],
         description: str,
 ):
     """
-    Generate a DeepDream video using 3D fractal Perlin noise.
+    Generate DeepDream videos from a single 3D fractal Perlin noise volume.
 
-    Each frame is a slice of 3D noise, providing temporal coherence.
-    Frames are optimized using discriminator features like standard DeepDream.
+    The volume has shape (num_frames, img_size, img_size) and is sliced along each
+    requested axis: 't' yields num_frames xy-slices (the classic video), while 'y'
+    and 'x' yield img_size slices of shape (num_frames, img_size) each. Every slice
+    is DeepDreamed independently with the chosen Discriminator layers; the temporal
+    coherence comes from the smoothness of the noise volume itself.
+
+    Non-square slices are tiled up to a Discriminator-friendly size, dreamed, and
+    cropped back, so the volume dimensions do not need to match the model resolution.
     """
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -1226,39 +1299,68 @@ def discriminator_dream_video(
     else:
         available_layers = get_available_layers(max_resolution=model_resolution)
         layers = [layer for layer in layers if layer in available_layers]
+    assert len(layers) > 0, f'No valid layers given! Available layers: {get_available_layers(model_resolution)}'
+
+    # Parse axes
+    axes = [axis.strip() for axis in axes.split(',') if axis.strip()]
+    assert all(axis in ('t', 'y', 'x') for axis in axes), f'Invalid axes "{axes}"; only "t", "y", and "x" are allowed'
+
+    img_size = model_resolution if img_size is None else img_size
+
+    # Both spatial dims of every slice must be divisible by this for the requested layers
+    multiple = get_padding_multiple(layers, model_resolution)
 
     # Make output directory
-    desc = f'discriminator-dream-video-{num_frames}frames'
+    desc = f'discriminator-dream-video-axes_{"-".join(axes)}'
     desc = f'{desc}-{description}' if description else desc
     run_dir = gen_utils.make_run_dir(outdir, desc)
 
-    print(f'Generating {num_frames} frames of 3D Perlin noise...')
-    noise_frames, _ = get_perlin_video(seed, num_frames, model_resolution, convert_to_grayscale, device, loop)
+    print(f'Generating a ({num_frames}, {img_size}, {img_size}) 3D Perlin noise volume...')
+    volume = get_perlin_volume(seed, num_frames, img_size, convert_to_grayscale, device, loop, noise_octaves)
 
-    # Number of digits for frame numbering
-    n_digits = int(np.log10(num_frames)) + 1
+    axis_videos = []
+    for axis in axes:
+        # Slice the volume perpendicular to the chosen axis; first dim indexes the slices
+        if axis == 't':
+            slices = volume                              # (T, H, W, C): xy planes
+        elif axis == 'y':
+            slices = volume.transpose(1, 0, 2, 3)        # (H, T, W, C): tx planes
+        else:
+            slices = volume.transpose(2, 0, 1, 3)        # (W, T, H, C): ty planes
 
-    print(f'Applying DeepDream to each frame...')
-    for frame_idx in tqdm(range(num_frames), desc='Dreaming', unit='frame'):
-        # Get frame as PIL Image
-        frame_np = noise_frames[frame_idx].cpu().numpy().transpose(1, 2, 0)
-        frame_pil = Image.fromarray(frame_np)
+        axis_dir = os.path.join(run_dir, f'axis_{axis}')
+        os.makedirs(axis_dir, exist_ok=True)
+        n_digits = int(np.log10(len(slices))) + 1
 
-        # Apply DeepDream to this frame
-        dreamed_frame = deep_dream(
-            frame_pil, model, model_resolution,
-            layers=layers, channels=channels, seed=None,
-            normed=norm_model_layers, sqrt_normed=sqrt_norm_model_layers,
-            iterations=iterations, lr=learning_rate,
-            octave_scale=octave_scale, num_octaves=num_octaves,
-            unzoom_octave=unzoom_octave,
-            disable_inner_tqdm=True,
-            ignore_initial_transform=True
-        )
+        for idx, slice_np in enumerate(tqdm(slices, desc=f'Dreaming along the {axis}-axis', unit='frame')):
+            # Preprocess the slice and tile it up to a Discriminator-friendly size
+            slice_tensor = preprocess(np.ascontiguousarray(slice_np))
+            slice_tensor, (h, w) = pad_to_multiple(slice_tensor, multiple)
 
-        # Save frame
-        filename = f'frame_{frame_idx:0{n_digits}d}.jpg'
-        Image.fromarray(dreamed_frame, 'RGB').save(os.path.join(run_dir, filename))
+            dreamed_frame = deep_dream(
+                slice_tensor, model, model_resolution,
+                layers=layers, channels=channels, seed=None,
+                normed=norm_model_layers, sqrt_normed=sqrt_norm_model_layers,
+                iterations=iterations, lr=learning_rate,
+                octave_scale=octave_scale, num_octaves=num_octaves,
+                unzoom_octave=unzoom_octave,
+                disable_inner_tqdm=True,
+                ignore_initial_transform=True
+            )
+
+            # Crop back to the slice size (made even, as yuv420p requires even dimensions)
+            dreamed_frame = dreamed_frame[:h - h % 2, :w - w % 2]
+            filename = f'frame_{idx:0{n_digits}d}.jpg'
+            Image.fromarray(dreamed_frame, 'RGB').save(os.path.join(axis_dir, filename))
+
+        gen_utils.save_video_from_images(run_dir=axis_dir, image_names=f'frame_%0{n_digits}d.jpg',
+                                         video_name=f'dream-video-{axis}_axis', fps=fps, reverse_video=False)
+        axis_videos.append(os.path.join(axis_dir, f'dream-video-{axis}_axis.mp4'))
+
+    # Stack the axis videos side by side for easy comparison
+    if combine and len(axis_videos) > 1:
+        print('Combining the axis videos side by side...')
+        combine_axis_videos(axis_videos, os.path.join(run_dir, 'dream-video-combined.mp4'), height=display_height)
 
     # Save configuration
     ctx.obj = {
@@ -1282,9 +1384,14 @@ def discriminator_dream_video(
             'unzoom_octave': unzoom_octave
         },
         'video_options': {
+            'axes': axes,
             'num_frames': num_frames,
+            'img_size': img_size,
+            'noise_octaves': noise_octaves,
             'loop': loop,
-            'fps': fps
+            'fps': fps,
+            'combine': combine,
+            'display_height': display_height
         },
         'extra_parameters': {
             'outdir': run_dir,
@@ -1293,15 +1400,7 @@ def discriminator_dream_video(
     }
     gen_utils.save_config(ctx=ctx, run_dir=run_dir)
 
-    # Generate video
-    print('Saving video...')
-    gen_utils.save_video_from_images(
-        run_dir=run_dir,
-        image_names=f'frame_%0{n_digits}d.jpg',
-        video_name='dream-video',
-        fps=fps,
-        reverse_video=False
-    )
+    print(f'Done! Results saved to {run_dir}')
 
 
 # ----------------------------------------------------------------------------

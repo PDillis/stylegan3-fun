@@ -63,7 +63,7 @@ def extract_layer_features(features_dict: OrderedDict, layers: List[str],
         if channels is not None:
             max_channels = feats.shape[1]
             valid_channels = [c for c in channels if 0 <= c < max_channels]
-            valid_channels = list(set(valid_channels))  # Remove duplicates
+            valid_channels = sorted(set(valid_channels))  # Remove duplicates, keep deterministic order
 
             if valid_channels:
                 if feats.dim() == 4:  # Conv layers: [B, C, H, W]
@@ -267,6 +267,12 @@ class DiscriminatorFeatures(nn.Module):
         """
         Extract features from specified discriminator layers.
 
+        The forward pass stops as soon as all requested layers have been computed,
+        so asking for shallow layers (e.g. 'b64_conv0') is much cheaper than running
+        the whole Discriminator. The input can be of any spatial size, as long as
+        both dimensions remain divisible by 2 for every downsampling step needed to
+        reach the deepest requested layer (pad the input if necessary).
+
         Args:
             x: Input image tensor [B, 3, H, W]
             layers: List of layer names (None = ['out'])
@@ -275,12 +281,13 @@ class DiscriminatorFeatures(nn.Module):
             sqrt_normed: If True, divide by sqrt of number of elements
 
         Returns:
-            Tuple of feature tensors
+            Tuple of feature tensors, in the same order as the requested layers
 
         Available layers:
             - 'from_rgb': Initial RGB conversion
             - 'b{res}_conv0', 'b{res}_conv1': Convolution layers at each resolution
-            - 'b{res}_skip': Skip connections
+              ('b{res}_conv1' is the block output, i.e., conv1 plus the skip branch)
+            - 'b{res}_skip': Skip branch alone (before the residual addition)
             - 'b4_mbstd', 'b4_conv': Final block
             - 'fc', 'out': Fully connected and output layers
         """
@@ -289,26 +296,39 @@ class DiscriminatorFeatures(nn.Module):
         layers = layers if layers is not None else ['out']
         norm_mode = 'numel' if normed else ('sqrt' if sqrt_normed else 'none')
 
-        # Build features dictionary
+        remaining = set(layers)
         features = OrderedDict()
-        features['from_rgb'] = getattr(self, 'from_rgb')(x)
 
-        # Process each resolution block
-        for idx, res in enumerate(self.block_resolutions):
-            prev_layer = 'from_rgb' if idx == 0 else f'b{self.block_resolutions[idx-1]}_conv1'
+        def store(name: str, value: torch.Tensor) -> None:
+            if name in remaining:
+                features[name] = value
+                remaining.discard(name)
 
-            features[f'b{res}_skip'] = getattr(self, f'b{res}_skip')(features[prev_layer], gain=np.sqrt(0.5))
-            features[f'b{res}_conv0'] = getattr(self, f'b{res}_conv0')(features[prev_layer])
-            features[f'b{res}_conv1'] = getattr(self, f'b{res}_conv1')(features[f'b{res}_conv0'], gain=np.sqrt(0.5))
+        y = self.from_rgb(x)
+        store('from_rgb', y)
 
-            # Skip connection addition (in-place)
-            features[f'b{res}_conv1'] = features[f'b{res}_skip'].add_(features[f'b{res}_conv1'])
+        # Process each resolution block, stopping early once all requested layers are computed
+        for res in self.block_resolutions:
+            if not remaining:
+                break
+            skip = getattr(self, f'b{res}_skip')(y, gain=np.sqrt(0.5))
+            store(f'b{res}_skip', skip)
+            conv0 = getattr(self, f'b{res}_conv0')(y)
+            store(f'b{res}_conv0', conv0)
+            y = skip + getattr(self, f'b{res}_conv1')(conv0, gain=np.sqrt(0.5))
+            store(f'b{res}_conv1', y)
 
-        # Final block (always at 8x8 → 4x4)
-        features['b4_mbstd'] = self.b4_mbstd(features['b8_conv1'])
-        features['b4_conv'] = self.b4_conv(features['b4_mbstd'])
-        features['b4_conv'] = self.adavgpool(features['b4_conv'])
-        features['fc'] = self.fc(features['b4_conv'].flatten(1))
-        features['out'] = self.out(features['fc'])
+        # Final block (4x4); only computed if any of its layers were requested
+        if remaining:
+            mbstd = self.b4_mbstd(y)
+            store('b4_mbstd', mbstd)
+            b4_conv = self.adavgpool(self.b4_conv(mbstd))
+            store('b4_conv', b4_conv)
+            fc = self.fc(b4_conv.flatten(1))
+            store('fc', fc)
+            store('out', self.out(fc))
+
+        if remaining:
+            raise ValueError(f'Unknown Discriminator layer(s): {sorted(remaining)}')
 
         return tuple(extract_layer_features(features, layers, channels, norm_mode))
