@@ -5,17 +5,13 @@ import torch.multiprocessing
 from torchvision import transforms
 
 import PIL
-from PIL import Image
-
-try:
-    import ffmpeg
-except ImportError:
-    raise ImportError('ffmpeg-python not found! Install it via "pip install ffmpeg-python"')
+from PIL import Image, ImageColor
 
 import numpy as np
 
 import os
 import shutil
+import subprocess
 import click
 from typing import Union, Tuple, Optional, List, Type
 from tqdm import tqdm
@@ -52,6 +48,68 @@ def get_available_layers(max_resolution: int) -> List[str]:
 
 
 # ----------------------------------------------------------------------------
+
+
+def get_model_name(network_pkl: Union[str, os.PathLike], cfg: Optional[str] = None, max_length: int = 10) -> str:
+    """
+    Compact model name for directory/file naming. Known model names from gen_utils.resume_specs
+    (e.g., 'ffhq1024', 'metfaces1024') are used in full; otherwise the file name of the local
+    path or URL (whatever precedes '.pkl') is used, shortened to max_length characters.
+    """
+    network_pkl = str(network_pkl)
+    if cfg is not None and network_pkl in gen_utils.resume_specs.get(cfg, {}):
+        return network_pkl
+    name = network_pkl.replace('\\', '/').split('/')[-1].split('.pkl')[0]
+    return name[:max_length] if len(name) > max_length else name
+
+
+def get_run_desc(network_pkl: Union[str, os.PathLike], cfg: Optional[str], *parts: str) -> str:
+    """Build a run directory description: '<model_name>[-<cfg>]-<part>-<part>-...'"""
+    return '-'.join([get_model_name(network_pkl, cfg)] + ([cfg] if cfg is not None else []) + [p for p in parts if p])
+
+
+def layers_tag(layers: List[str], max_layers: int = 3) -> str:
+    """Compact tag describing the layers used, for directory naming"""
+    return '-'.join(layers) if len(layers) <= max_layers else f'{len(layers)}_layers'
+
+
+# ----------------------------------------------------------------------------
+# Video helpers: call the ffmpeg binary directly via subprocess
+
+
+def _ffmpeg_bin() -> str:
+    ffmpeg_bin = shutil.which('ffmpeg')
+    if ffmpeg_bin is None:
+        raise RuntimeError('ffmpeg not found! Install it and make sure it is in your PATH.')
+    return ffmpeg_bin
+
+
+def save_video_ffmpeg(frames_dir: Union[str, os.PathLike],
+                      image_pattern: str,
+                      video_name: str,
+                      fps: int = 30,
+                      crf: int = 20,
+                      preset: str = 'veryfast',
+                      reverse_video: bool = False) -> str:
+    """
+    Assemble the frames matching `image_pattern` (printf-style, e.g. 'frame_%04d.jpg') in
+    `frames_dir` into an .mp4, by invoking the ffmpeg binary directly. Returns the video path.
+    """
+    video_path = os.path.join(frames_dir, f'{video_name}.mp4')
+    print(f'Saving video to "{video_path}"...')
+    subprocess.run([_ffmpeg_bin(), '-y', '-loglevel', 'error',
+                    '-framerate', str(fps), '-i', os.path.join(frames_dir, image_pattern),
+                    '-c:v', 'libx264', '-preset', preset, '-crf', str(crf), '-pix_fmt', 'yuv420p',
+                    video_path], check=True)
+    if reverse_video:
+        # Save the reversed video apart from the original one, so the user can compare both
+        subprocess.run([_ffmpeg_bin(), '-y', '-loglevel', 'error', '-i', video_path,
+                        '-vf', 'reverse', '-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
+                        '-pix_fmt', 'yuv420p', os.path.join(frames_dir, f'{video_name}_reversed.mp4')], check=True)
+    return video_path
+
+
+# ----------------------------------------------------------------------------
 # DeepDream code; modified from Erik Linder-Norén's repository: https://github.com/eriklindernoren/PyTorch-Deep-Dream
 
 def get_image(seed: int = 0,
@@ -65,7 +123,8 @@ def get_image(seed: int = 0,
 
     Args:
         seed: Random seed for reproducibility
-        image_noise: Type of noise ('random' or 'perlin')
+        image_noise: 'random', 'perlin', or any solid color understood by PIL
+                     (a name like 'white'/'black'/'red', or hex like '#ff8800')
         starting_image: Path to existing image (if None, generates new)
         image_size: Size of generated image
         convert_to_grayscale: Convert to grayscale
@@ -92,6 +151,15 @@ def get_image(seed: int = 0,
             # Stretch to the full [0, 255] range (raw fractal Perlin rarely reaches +-1)
             noise = (noise - noise.min()) / (np.ptp(noise) + 1e-8)
             image = Image.fromarray((255 * noise).astype(np.uint8).transpose(1, 2, 0))
+        else:
+            # Treat anything else as a solid color (e.g., 'white', 'black', 'red', '#ff8800')
+            try:
+                color = ImageColor.getrgb(image_noise)
+            except ValueError:
+                raise ValueError(f'Unknown image noise type/color "{image_noise}"! Use "random", "perlin", '
+                                 'or any color name/hex code understood by PIL (e.g., "white", "#ff8800")')
+            starting_image = f'{image_noise.replace("#", "hex")}_image.jpg'
+            image = Image.new('RGB', (image_size, image_size), color)
 
     if convert_to_grayscale:
         image = image.convert('L').convert('RGB')
@@ -437,7 +505,7 @@ def style_transfer_discriminator(
     optimizer = torch.optim.LBFGS([input_img], lr=lr, max_iter=20)
 
     # Make output directory
-    desc = 'discriminator-style-transfer'
+    desc = get_run_desc(network_pkl, cfg, 'style-transfer')
     desc = f'{desc}-{description}' if description else desc
     run_dir = gen_utils.make_run_dir(outdir, desc)
 
@@ -523,7 +591,7 @@ def style_transfer_discriminator(
 @click.option('--cfg', type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), help='Model base configuration', default=None)
 # Synthesis options
 @click.option('--seeds', type=gen_utils.num_range, help='Random seeds to use. Accepted comma-separated values, ranges, or combinations: "a,b,c", "a-c", "a,b-d,e".', default='0')
-@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'perlin']), default='perlin', show_default=True)
+@click.option('--random-image-noise', '-noise', 'image_noise', type=str, help='Starting image content: "random" noise, "perlin" noise, or any solid color understood by PIL (e.g., "white", "black", "#ff8800")', default='perlin', show_default=True)
 @click.option('--starting-image', type=str, help='Path to image to start from', default=None)
 @click.option('--convert-to-grayscale', '-grayscale', is_flag=True, help='Add flag to grayscale the initial image')
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)', default=None)
@@ -592,7 +660,7 @@ def discriminator_dream(
                                               convert_to_grayscale=convert_to_grayscale)
 
             # Make the run dir in the specified output directory
-            desc = f'discriminator-dream-all_layers-seed_{seed}'
+            desc = get_run_desc(network_pkl, cfg, 'dream-all_layers', f'seed_{seed}')
             desc = f'{desc}-{description}' if len(description) != 0 else desc
             run_dir = gen_utils.make_run_dir(outdir, desc)
 
@@ -646,7 +714,7 @@ def discriminator_dream(
             layers = [layer for layer in layers if layer in available_layers]
 
         # Make the run dir in the specified output directory
-        desc = f'discriminator-dream-layers_{"-".join(x for x in layers)}'
+        desc = get_run_desc(network_pkl, cfg, 'dream', f'layers_{layers_tag(layers)}')
         desc = f'{desc}-{description}' if len(description) != 0 else desc
         run_dir = gen_utils.make_run_dir(outdir, desc)
 
@@ -729,7 +797,7 @@ def discriminator_dream(
 @click.option('--cfg', type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), help='Model base configuration', default=None)
 # Synthesis options
 @click.option('--seed', type=int, help='Random seed to use', default=0, show_default=True)
-@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'perlin']), default='random', show_default=True)
+@click.option('--random-image-noise', '-noise', 'image_noise', type=str, help='Starting image content: "random" noise, "perlin" noise, or any solid color understood by PIL (e.g., "white", "black", "#ff8800")', default='random', show_default=True)
 @click.option('--starting-image', type=str, help='Path to image to start from', default=None)
 @click.option('--convert-to-grayscale', '-grayscale', is_flag=True, help='Add flag to grayscale the initial image')
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)', default=None)
@@ -815,7 +883,7 @@ def discriminator_dream_zoom(
                                       convert_to_grayscale=convert_to_grayscale)
 
     # Make the run dir in the specified output directory
-    desc = 'discriminator-dream-zoom'
+    desc = get_run_desc(network_pkl, cfg, 'dream-zoom', f'layers_{layers_tag(layers)}')
     desc = f'{desc}-{description}' if len(description) != 0 else desc
     run_dir = gen_utils.make_run_dir(outdir, desc)
 
@@ -887,8 +955,7 @@ def discriminator_dream_zoom(
         image = Image.fromarray(dreamed_image)
 
     # Save the final video
-    gen_utils.save_video_from_images(run_dir=run_dir, image_names=f'dreamed_%0{n_digits}d.jpg',
-                                     video_name='dream-zoom', fps=fps, reverse_video=reverse_video)
+    save_video_ffmpeg(run_dir, f'dreamed_%0{n_digits}d.jpg', 'dream-zoom', fps=fps, reverse_video=reverse_video)
 
 
 # ----------------------------------------------------------------------------
@@ -899,7 +966,7 @@ def discriminator_dream_zoom(
 @click.option('--cfg', type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), help='Model base configuration', default=None)
 # Synthesis options
 @click.option('--seed', type=int, help='Random seed to use', default=0, show_default=True)
-@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'perlin']), default='random', show_default=True)
+@click.option('--random-image-noise', '-noise', 'image_noise', type=str, help='Starting image content: "random" noise, "perlin" noise, or any solid color understood by PIL (e.g., "white", "black", "#ff8800")', default='random', show_default=True)
 @click.option('--starting-image', type=str, help='Path to image to start from', default=None)
 @click.option('--convert-to-grayscale', '-grayscale', is_flag=True, help='Add flag to grayscale the initial image')
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)', default=None)
@@ -983,7 +1050,7 @@ def channel_zoom(
                                       convert_to_grayscale=convert_to_grayscale)
 
     # Make the run dir in the specified output directory
-    desc = 'discriminator-channel-zoom'
+    desc = get_run_desc(network_pkl, cfg, 'channel-zoom', f'layer_{layer}')
     desc = f'{desc}-{description}' if len(description) != 0 else desc
     run_dir = gen_utils.make_run_dir(outdir, desc)
 
@@ -1022,8 +1089,7 @@ def channel_zoom(
         image = Image.fromarray(dreamed_image)
 
     # Save the final video
-    gen_utils.save_video_from_images(run_dir=run_dir, image_names=f'dreamed_%0{n_digits}d.jpg', video_name='channel-zoom',
-                                     fps=fps, reverse_video=reverse_video)
+    save_video_ffmpeg(run_dir, f'dreamed_%0{n_digits}d.jpg', 'channel-zoom', fps=fps, reverse_video=reverse_video)
 
     # Save the configuration used
     ctx.obj = {
@@ -1080,7 +1146,7 @@ def channel_zoom(
 @click.option('--seeds', type=gen_utils.num_range, help='Random seeds to generate the Perlin noise from', required=True)
 @click.option('--interp-type', '-interp', type=click.Choice(['linear', 'spherical']), help='Type of interpolation in Z or W', default='spherical', show_default=True)
 @click.option('--smooth', is_flag=True, help='Add flag to smooth the interpolation between the seeds')
-@click.option('--random-image-noise', '-noise', 'image_noise', type=click.Choice(['random', 'perlin']), default='random', show_default=True)
+@click.option('--random-image-noise', '-noise', 'image_noise', type=str, help='Starting image content: "random" noise, "perlin" noise, or any solid color understood by PIL (e.g., "white", "black", "#ff8800")', default='random', show_default=True)
 @click.option('--starting-image', type=str, help='Path to image to start from', default=None)
 @click.option('--convert-to-grayscale', '-grayscale', is_flag=True, help='Add flag to grayscale the initial image')
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)', default=None)
@@ -1153,7 +1219,7 @@ def random_interpolation(
         layers = [layer for layer in layers if layer in available_layers]
 
     # Make the run dir in the specified output directory
-    desc = f'random-interp-layers_{"-".join(x for x in layers)}'
+    desc = get_run_desc(network_pkl, cfg, 'interp', f'layers_{layers_tag(layers)}')
     desc = f'{desc}-{description}' if len(description) != 0 else desc
     run_dir = gen_utils.make_run_dir(outdir, desc)
 
@@ -1228,8 +1294,7 @@ def random_interpolation(
     gen_utils.save_config(ctx=ctx, run_dir=run_dir)
 
     # Generate video
-    gen_utils.save_video_from_images(run_dir=run_dir, image_names=f'{image_noise}-interpolation_frame_%0{n_digits}d.jpg',
-                                     video_name=f'{image_noise}-interpolation', fps=fps, reverse_video=False)
+    save_video_ffmpeg(run_dir, f'{image_noise}-interpolation_frame_%0{n_digits}d.jpg', f'{image_noise}-interpolation', fps=fps)
 
 # ----------------------------------------------------------------------------
 
@@ -1304,13 +1369,19 @@ def _dream_video_worker(rank: int, num_gpus: int, volume_path: str, run_dir: str
 
 def combine_axis_videos(video_paths: List[Union[str, os.PathLike]],
                         out_path: Union[str, os.PathLike],
-                        height: int = 512) -> None:
+                        height: int = 512,
+                        crf: int = 20,
+                        preset: str = 'veryfast') -> None:
     """Stack videos side by side (scaled to a common height, trimmed to the shortest one)"""
-    ffmpeg_command = shutil.which('ffmpeg') or 'ffmpeg'
-    streams = [ffmpeg.input(str(p)).filter('scale', -2, height) for p in video_paths]
-    joined = ffmpeg.filter(streams, 'hstack', inputs=len(streams), shortest=1)
-    stream = ffmpeg.output(joined, str(out_path), crf=20, pix_fmt='yuv420p')
-    ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, cmd=ffmpeg_command, overwrite_output=True)
+    n = len(video_paths)
+    cmd = [_ffmpeg_bin(), '-y', '-loglevel', 'error']
+    for path in video_paths:
+        cmd += ['-i', str(path)]
+    filters = ';'.join(f'[{i}:v]scale=-2:{height}[v{i}]' for i in range(n))
+    filters += ';' + ''.join(f'[v{i}]' for i in range(n)) + f'hstack=inputs={n}:shortest=1[out]'
+    cmd += ['-filter_complex', filters, '-map', '[out]',
+            '-c:v', 'libx264', '-preset', preset, '-crf', str(crf), '-pix_fmt', 'yuv420p', str(out_path)]
+    subprocess.run(cmd, check=True)
 
 
 @main.command(name='dream-video', help='DeepDream a 3D fractal Perlin noise volume, sliced along the t, y, and/or x axes')
@@ -1431,7 +1502,7 @@ def discriminator_dream_video(
     multiple = get_padding_multiple(layers, model_resolution)
 
     # Make output directory
-    desc = f'discriminator-dream-video-axes_{"-".join(axes)}'
+    desc = get_run_desc(network_pkl, cfg, 'dream-video', f'axes_{"-".join(axes)}', f'layers_{layers_tag(layers)}')
     desc = f'{desc}-{description}' if description else desc
     run_dir = gen_utils.make_run_dir(outdir, desc)
     for axis in axes:
@@ -1478,8 +1549,7 @@ def discriminator_dream_video(
         num_slices = num_frames if axis == 't' else img_size
         n_digits = int(np.log10(num_slices)) + 1
         axis_dir = os.path.join(run_dir, f'axis_{axis}')
-        gen_utils.save_video_from_images(run_dir=axis_dir, image_names=f'frame_%0{n_digits}d.jpg',
-                                         video_name=f'dream-video-{axis}_axis', fps=fps, reverse_video=False)
+        save_video_ffmpeg(axis_dir, f'frame_%0{n_digits}d.jpg', f'dream-video-{axis}_axis', fps=fps)
         axis_videos.append(os.path.join(axis_dir, f'dream-video-{axis}_axis.mp4'))
 
     # Stack the axis videos side by side for easy comparison
