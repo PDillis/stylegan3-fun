@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import click
+from dataclasses import dataclass
 from typing import Union, Tuple, Optional, List, Type
 from tqdm import tqdm
 import re
@@ -20,6 +21,7 @@ import re
 from torch_utils import gen_utils
 from network_features import DiscriminatorFeatures
 from fractalperlin import get_2d_perlin, get_3d_perlin
+from pytorch_ssim import gaussian as _gaussian_1d
 
 
 # ----------------------------------------------------------------------------
@@ -300,6 +302,82 @@ def clip(image_tensor: torch.Tensor) -> torch.Tensor:
     return torch.min(torch.max(image_tensor, lo), hi)
 
 
+# ----------------------------------------------------------------------------
+# Anti-saturation helpers. DeepDream ascent on the feature norm, bounded only by a hard clamp,
+# drifts to pure white and pins there. These keep brightness/contrast steady and remove the
+# hard 0/1 pile-up. See the DreamConfig dataclass for the knobs and get_image for starting colors.
+
+
+@dataclass
+class DreamConfig:
+    """Anti-saturation settings threaded through deep_dream()/dream()."""
+    anti_saturation: bool = True         # renormalize to a held mean/std each step
+    soft_clip: bool = True               # smooth (tanh-family) bound instead of hard clamp
+    target_mean: Optional[float] = None  # [0, 1]; None -> hold the starting image's own mean
+    target_std: Optional[float] = None   # [0, 1]; None -> hold the starting image's own std
+    grad_smooth: float = 0.5             # Gaussian sigma to blur the gradient (0 = off)
+    jitter: int = 0                      # max random shift in pixels for the forward pass (0 = off)
+    flip: bool = False                   # random horizontal flip for the forward pass
+
+
+def soft_clip(x: torch.Tensor, lo: float = -1.0, hi: float = 1.0, beta: float = 8.0) -> torch.Tensor:
+    """
+    Softplus-based smooth clamp to [lo, hi]: near-identity in the interior, easing smoothly past the
+    bounds without ever reaching them exactly. Preferred over plain tanh(x), which compresses interior
+    contrast every step and would fight the renormalization into a washed-out result.
+    """
+    x = lo + F.softplus(x - lo, beta=beta)
+    x = hi - F.softplus(hi - x, beta=beta)
+    return x
+
+
+_gauss_window_cache = {}
+
+
+def gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Depthwise Gaussian blur of a (B, C, H, W) tensor; reuses pytorch_ssim's 1D Gaussian."""
+    if sigma <= 0:
+        return x
+    channels = x.shape[1]
+    key = (round(sigma, 3), channels, x.device, x.dtype)
+    window = _gauss_window_cache.get(key)
+    if window is None:
+        radius = max(1, int(round(3 * sigma)))
+        window_size = 2 * radius + 1
+        w1d = _gaussian_1d(window_size, sigma).to(device=x.device, dtype=x.dtype)
+        w2d = torch.outer(w1d, w1d)
+        window = w2d.expand(channels, 1, window_size, window_size).contiguous()
+        _gauss_window_cache[key] = window
+    padding = window.shape[-1] // 2
+    return F.conv2d(x, window, padding=padding, groups=channels)
+
+
+def _resolve_target(image: torch.Tensor, config: DreamConfig) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Resolve the per-sample, per-channel (mean, std) that renormalization holds the image to.
+    Defaults to the input image's own statistics (preserving the starting color/brightness);
+    a flat solid-color start (std ~ 0) falls back to a neutral std so structure can still emerge.
+    Explicit config.target_mean/std are given in [0, 1] and converted to the normalized [-1, 1] space.
+    """
+    neutral_std_norm = 2 * 0.22  # 0.22 in [0, 1] -> normalized space (std scales by 1/0.5)
+    t_mean = image.mean(dim=(2, 3), keepdim=True)
+    t_std = image.std(dim=(2, 3), keepdim=True)
+    t_std = torch.where(t_std < 1e-3, torch.full_like(t_std, neutral_std_norm), t_std)
+    if config.target_mean is not None:
+        t_mean = torch.full_like(t_mean, 2 * config.target_mean - 1)
+    if config.target_std is not None:
+        t_std = torch.full_like(t_std, 2 * config.target_std)
+    return t_mean, t_std
+
+
+def renormalize(image: torch.Tensor, target_mean: torch.Tensor, target_std: torch.Tensor,
+                eps: float = 1e-5) -> torch.Tensor:
+    """Per-sample, per-channel standardize the image back to (target_mean, target_std)."""
+    cur_mean = image.mean(dim=(2, 3), keepdim=True)
+    cur_std = image.std(dim=(2, 3), keepdim=True)
+    return (image - cur_mean) / (cur_std + eps) * target_std + target_mean
+
+
 def dream(image: torch.Tensor,
           model: torch.nn.Module,
           layers: List[str],
@@ -307,21 +385,53 @@ def dream(image: torch.Tensor,
           normed: bool = False,
           sqrt_normed: bool = False,
           iterations: int = 20,
-          lr: float = 1e-2) -> torch.Tensor:
+          lr: float = 1e-2,
+          config: DreamConfig = None,
+          target_mean: torch.Tensor = None,
+          target_std: torch.Tensor = None,
+          generator: torch.Generator = None) -> torch.Tensor:
     """
     Updates the (preprocessed, on-device) image to maximize the chosen layer outputs for n iterations.
     Batches are supported: the loss and the gradient-normalized step are computed per sample,
     so each image in the batch dreams independently, exactly as if processed alone.
+
+    Anti-saturation (via `config`): optional per-forward jitter/flip augmentation, Gaussian blur of
+    the gradient (high-frequency suppression), renormalization to a held mean/std, and a smooth bound
+    replacing the hard clamp. With `config.anti_saturation` off and no blur/jitter it reduces exactly
+    to the original hard-clip ascent.
     """
+    config = config if config is not None else DreamConfig()
+    if config.anti_saturation and target_mean is None:
+        target_mean, target_std = _resolve_target(image, config)
+
     image = image.detach().clone().requires_grad_(True)
     for _ in range(iterations):
-        out = model.get_layers_features(image, layers=layers, channels=channels, normed=normed, sqrt_normed=sqrt_normed)
+        # Optional augmentation for the forward pass only; autograd carries the gradient back to
+        # `image` through the (differentiable) roll/flip, so no manual un-shift is needed.
+        inp = image
+        if config.jitter > 0:
+            sy, sx = torch.randint(-config.jitter, config.jitter + 1, (2,), generator=generator).tolist()
+            inp = torch.roll(inp, shifts=(sy, sx), dims=(2, 3))
+        if config.flip and torch.rand(1, generator=generator).item() < 0.5:
+            inp = torch.flip(inp, dims=[3])
+
+        out = model.get_layers_features(inp, layers=layers, channels=channels, normed=normed, sqrt_normed=sqrt_normed)
         loss = sum(layer.flatten(1).norm(dim=1).sum() for layer in out)  # Per-sample norm; more than one layer may be used
         loss.backward()
         with torch.no_grad():
-            avg_grad = image.grad.abs().mean(dim=(1, 2, 3), keepdim=True)
-            image += lr / (avg_grad + 1e-12) * image.grad
-            image.copy_(clip(image))
+            grad = image.grad
+            if config.grad_smooth > 0:
+                grad = gaussian_blur(grad, config.grad_smooth)
+            avg_grad = grad.abs().mean(dim=(1, 2, 3), keepdim=True)
+            image += lr / (avg_grad + 1e-12) * grad
+            if config.anti_saturation:
+                image.copy_(renormalize(image, target_mean, target_std))
+                if config.soft_clip:
+                    image.copy_(soft_clip(image))
+                else:
+                    image.copy_(clip(image))
+            else:
+                image.copy_(clip(image))
             image.grad.zero_()
     return image.detach()
 
@@ -340,12 +450,18 @@ def deep_dream(image: Union[PIL.Image.Image, torch.Tensor],
                num_octaves: int,
                unzoom_octave: bool = False,
                disable_inner_tqdm: bool = False,
-               ignore_initial_transform: bool = False) -> np.ndarray:
+               ignore_initial_transform: bool = False,
+               config: DreamConfig = None) -> np.ndarray:
     """
     Main deep dream method. `image` can be a PIL.Image (which will be preprocessed) or an
     already-preprocessed tensor of shape (C, H, W) or (1, C, H, W) in normalized [-1, 1] space.
     Everything runs on the model's device; the only CPU transfer is the final deprocessed result.
+
+    Anti-saturation settings are carried in `config` (see DreamConfig); the mean/std target is
+    captured once from the full-resolution input and held across every octave, so global
+    brightness/contrast stays locked to the starting image.
     """
+    config = config if config is not None else DreamConfig()
     device = next(model.parameters()).device
     if isinstance(image, Image.Image):
         # Center-crop and resize
@@ -355,6 +471,23 @@ def deep_dream(image: Union[PIL.Image.Image, torch.Tensor],
     image = image.detach().to(device)
     if image.dim() == 3:
         image = image.unsqueeze(0)
+
+    # Capture the held mean/std target once, from the full-res input (global brightness/contrast lock)
+    target_mean = target_std = None
+    if config.anti_saturation:
+        target_mean, target_std = _resolve_target(image, config)
+
+    # Seed a generator for reproducible jitter/flip augmentation (if enabled). `seed` may be an int,
+    # a list of seeds (batched dream), or None; derive a single int to seed the generator.
+    aug_generator = None
+    if config.jitter > 0 or config.flip:
+        if isinstance(seed, (list, tuple)):
+            seed_val = int(seed[0]) if len(seed) else 0
+        elif seed is not None:
+            seed_val = int(seed)
+        else:
+            seed_val = 0
+        aug_generator = torch.Generator(device='cpu').manual_seed(seed_val)
 
     # Extract image representations for each octave (coarse to fine), on-device
     octaves = [image]
@@ -376,11 +509,51 @@ def deep_dream(image: Union[PIL.Image.Image, torch.Tensor],
             # Upsample detail to new octave dimension
             detail = F.interpolate(detail, size=octave_base.shape[-2:], mode='bilinear', align_corners=False)
         # Add deep dream detail from previous octave to new base, and get new deep dream image
-        dreamed_image = dream(octave_base + detail, model, layers, channels, normed, sqrt_normed, iterations, lr)
+        dreamed_image = dream(octave_base + detail, model, layers, channels, normed, sqrt_normed, iterations, lr,
+                              config=config, target_mean=target_mean, target_std=target_std, generator=aug_generator)
         # Extract deep dream details
         detail = dreamed_image - octave_base
 
     return deprocess(dreamed_image)
+
+
+# ----------------------------------------------------------------------------
+
+
+def saturation_options(default_jitter: int = 0, default_flip: bool = False):
+    """
+    Reusable set of anti-saturation click options shared by all generation commands. Jitter/flip
+    are random per forward pass, so they default off for the sequence commands (per-frame randomness
+    adds flicker) and on for the single-image `dream`. Returns a decorator that stacks the options.
+    """
+    def decorator(func):
+        options = [
+            click.option('--anti-saturation/--no-anti-saturation', 'anti_saturation', default=True, show_default=True,
+                         help='Renormalize to a held mean/std each step so brightness/contrast stay steady (stops the drift to white)'),
+            click.option('--soft-clip/--no-soft-clip', 'soft_clip', default=True, show_default=True,
+                         help='Smoothly bound pixels (tanh-family) instead of a hard 0/1 clamp'),
+            click.option('--target-mean', type=click.FloatRange(0.0, 1.0), default=None,
+                         help='Target pixel mean in [0, 1] to hold (default: the starting image\'s own mean)'),
+            click.option('--target-std', type=click.FloatRange(0.0, 1.0), default=None,
+                         help='Target pixel std in [0, 1] to hold (default: the starting image\'s own std)'),
+            click.option('--grad-smooth', type=click.FloatRange(min=0.0), default=0.5, show_default=True,
+                         help='Gaussian sigma to blur the gradient each step, suppressing high frequencies (0 = off)'),
+            click.option('--jitter', type=click.IntRange(min=0), default=default_jitter, show_default=True,
+                         help='Max random shift in pixels applied to the forward pass (transformation robustness; 0 = off)'),
+            click.option('--flip/--no-flip', 'flip', default=default_flip, show_default=True,
+                         help='Randomly horizontally flip the forward pass (transformation robustness)'),
+        ]
+        for option in reversed(options):
+            func = option(func)
+        return func
+    return decorator
+
+
+def build_dream_config(anti_saturation: bool, soft_clip: bool, target_mean: Optional[float],
+                       target_std: Optional[float], grad_smooth: float, jitter: int, flip: bool) -> DreamConfig:
+    """Assemble a DreamConfig from the saturation_options click params."""
+    return DreamConfig(anti_saturation=anti_saturation, soft_clip=soft_clip, target_mean=target_mean,
+                       target_std=target_std, grad_smooth=grad_smooth, jitter=jitter, flip=flip)
 
 
 # ----------------------------------------------------------------------------
@@ -608,6 +781,8 @@ def style_transfer_discriminator(
 @click.option('--unzoom-octave', type=bool, help='Set to True for the octaves to be unzoomed (this will be slower)', default=True, show_default=True)
 # Performance options
 @click.option('--batch-size', type=click.IntRange(min=1), help='Number of seeds to dream per forward pass (ignored when --layers=all)', default=1, show_default=True)
+# Anti-saturation options (jitter/flip default on for single images)
+@saturation_options(default_jitter=8, default_flip=True)
 # Extra parameters for saving the results
 @click.option('--outdir', type=click.Path(file_okay=False), help='Directory path to save the results', default=os.path.join(os.getcwd(), 'out', 'discriminator_synthesis'), show_default=True, metavar='DIR')
 @click.option('--description', '-desc', type=str, help='Additional description name for the directory path to save results', default='', show_default=True)
@@ -630,6 +805,13 @@ def discriminator_dream(
         octave_scale: float,
         unzoom_octave: bool,
         batch_size: int,
+        anti_saturation: bool,
+        soft_clip: bool,
+        target_mean: Optional[float],
+        target_std: Optional[float],
+        grad_smooth: float,
+        jitter: int,
+        flip: bool,
         outdir: Union[str, os.PathLike],
         description: str,
 ):
@@ -647,6 +829,10 @@ def discriminator_dream(
 
     # We will use the features of the Discriminator, on the layer specified by the user
     model = DiscriminatorFeatures(D).requires_grad_(False).to(device)
+
+    # Anti-saturation configuration (shared across all seeds/layers)
+    config = build_dream_config(anti_saturation, soft_clip, target_mean, target_std, grad_smooth, jitter, flip)
+    anti_saturation_cfg = vars(config)
 
     if 'all' in layers:
         # Get all the available layers in a list
@@ -686,6 +872,7 @@ def discriminator_dream(
                     'num_octaves': num_octaves,
                     'octave_scale': octave_scale,
                     'unzoom_octave': unzoom_octave},
+                'anti_saturation_options': anti_saturation_cfg,
                 'extra_parameters': {
                     'outdir': run_dir,
                     'description': description}
@@ -698,7 +885,7 @@ def discriminator_dream(
                 # Extract deep dream image
                 dreamed_image = deep_dream(image, model, model_resolution, layers=[layer], channels=channels, seed=seed, normed=norm_model_layers,
                                            sqrt_normed=sqrt_norm_model_layers, iterations=iterations, lr=learning_rate,
-                                           octave_scale=octave_scale, num_octaves=num_octaves, unzoom_octave=unzoom_octave)
+                                           octave_scale=octave_scale, num_octaves=num_octaves, unzoom_octave=unzoom_octave, config=config)
 
                 # Save the resulting dreamed image
                 filename = f'layer-{layer}_dreamed_{os.path.basename(starting_image).split(".")[0]}.jpg'
@@ -745,7 +932,7 @@ def discriminator_dream(
                                         normed=norm_model_layers, sqrt_normed=sqrt_norm_model_layers,
                                         iterations=iterations, lr=learning_rate, octave_scale=octave_scale,
                                         num_octaves=num_octaves, unzoom_octave=unzoom_octave,
-                                        ignore_initial_transform=True)
+                                        ignore_initial_transform=True, config=config)
             if dreamed_images.ndim == 3:
                 dreamed_images = dreamed_images[None]
 
@@ -779,6 +966,7 @@ def discriminator_dream(
                 'unzoom_octave': unzoom_octave},
             'performance_options': {
                 'batch_size': batch_size},
+            'anti_saturation_options': anti_saturation_cfg,
             'extra_parameters': {
                 'outdir': run_dir,
                 'description': description}
@@ -822,6 +1010,8 @@ def discriminator_dream(
 @click.option('--duration-sec', type=float, help='Duration length of the video', default=15.0, show_default=True)
 @click.option('--reverse-video', is_flag=True, help='Add flag to reverse the generated video')
 @click.option('--include-starting-image', type=bool, help='Include the starting image in the final video', default=True, show_default=True)
+# Anti-saturation options (jitter/flip default off for sequences to preserve temporal coherence)
+@saturation_options()
 # Extra parameters for saving the results
 @click.option('--outdir', type=click.Path(file_okay=False), help='Directory path to save the results', default=os.path.join(os.getcwd(), 'out', 'discriminator_synthesis'), show_default=True, metavar='DIR')
 @click.option('--description', '-desc', type=str, help='Additional description name for the directory path to save results', default='', show_default=True)
@@ -851,6 +1041,13 @@ def discriminator_dream_zoom(
         duration_sec: float,
         reverse_video: bool,
         include_starting_image: bool,
+        anti_saturation: bool,
+        soft_clip: bool,
+        target_mean: Optional[float],
+        target_std: Optional[float],
+        grad_smooth: float,
+        jitter: int,
+        flip: bool,
         outdir: Union[str, os.PathLike],
         description: str,
 ):
@@ -875,6 +1072,9 @@ def discriminator_dream_zoom(
 
     # We will use the features of the Discriminator, on the layer specified by the user
     model = DiscriminatorFeatures(D).requires_grad_(False).to(device)
+
+    # Anti-saturation configuration
+    config = build_dream_config(anti_saturation, soft_clip, target_mean, target_std, grad_smooth, jitter, flip)
 
     # Get the image and image name
     image, starting_image = get_image(seed=seed, image_noise=image_noise,
@@ -921,6 +1121,7 @@ def discriminator_dream_zoom(
             'reverse_video': reverse_video,
             'include_starting_image': include_starting_image,
         },
+        'anti_saturation_options': vars(config),
         'extra_parameters': {
             'outdir': run_dir,
             'description': description
@@ -945,7 +1146,7 @@ def discriminator_dream_zoom(
         dreamed_image = deep_dream(image, model, model_resolution, layers=layers, seed=seed, normed=norm_model_layers,
                                    sqrt_normed=sqrt_norm_model_layers, iterations=iterations, channels=channels,
                                    lr=learning_rate, octave_scale=octave_scale, num_octaves=num_octaves,
-                                   unzoom_octave=unzoom_octave, disable_inner_tqdm=True)
+                                   unzoom_octave=unzoom_octave, disable_inner_tqdm=True, config=config)
 
         # Save the resulting image and initial image
         filename = f'dreamed_{idx + 1:0{n_digits}d}.jpg'
@@ -990,6 +1191,8 @@ def discriminator_dream_zoom(
 @click.option('--fps', type=gen_utils.parse_fps, help='FPS for the mp4 video of optimization progress (if saved)', default=25, show_default=True)
 @click.option('--reverse-video', is_flag=True, help='Add flag to reverse the generated video')
 @click.option('--include-starting-image', type=bool, help='Include the starting image in the final video', default=True, show_default=True)
+# Anti-saturation options (jitter/flip default off for sequences to preserve temporal coherence)
+@saturation_options()
 # Extra parameters for saving the results
 @click.option('--outdir', type=click.Path(file_okay=False), help='Directory path to save the results', default=os.path.join(os.getcwd(), 'out', 'discriminator_synthesis'), show_default=True, metavar='DIR')
 @click.option('--description', '-desc', type=str, help='Additional description name for the directory path to save results', default='', show_default=True)
@@ -1018,6 +1221,13 @@ def channel_zoom(
         fps: int,
         reverse_video: bool,
         include_starting_image: bool,
+        anti_saturation: bool,
+        soft_clip: bool,
+        target_mean: Optional[float],
+        target_std: Optional[float],
+        grad_smooth: float,
+        jitter: int,
+        flip: bool,
         outdir: Union[str, os.PathLike],
         description: str,
 ):
@@ -1042,6 +1252,9 @@ def channel_zoom(
 
     # We will use the features of the Discriminator, on the layer specified by the user
     model = DiscriminatorFeatures(D).requires_grad_(False).to(device)
+
+    # Anti-saturation configuration
+    config = build_dream_config(anti_saturation, soft_clip, target_mean, target_std, grad_smooth, jitter, flip)
 
     # Get the image and image name
     image, starting_image = get_image(seed=seed, image_noise=image_noise,
@@ -1079,7 +1292,7 @@ def channel_zoom(
         dreamed_image = deep_dream(image, model, model_resolution, layers=layers, seed=seed, normed=norm_model_layers,
                                    sqrt_normed=sqrt_norm_model_layers, iterations=iterations, channels=channels[idx:idx + 1],
                                    lr=learning_rate, octave_scale=octave_scale, num_octaves=num_octaves,
-                                   unzoom_octave=unzoom_octave, disable_inner_tqdm=True)
+                                   unzoom_octave=unzoom_octave, disable_inner_tqdm=True, config=config)
 
         # Save the resulting image and initial image
         filename = f'dreamed_{idx + 1:0{n_digits}d}.jpg'
@@ -1126,6 +1339,7 @@ def channel_zoom(
             'reverse_video': reverse_video,
             'include_starting_image': include_starting_image,
         },
+        'anti_saturation_options': vars(config),
         'extra_parameters': {
             'outdir': run_dir,
             'description': description
@@ -1165,6 +1379,8 @@ def channel_zoom(
 # Video options
 @click.option('--seed-sec', '-sec', type=float, help='Number of seconds between each seed transition', default=5.0, show_default=True)
 @click.option('--fps', type=gen_utils.parse_fps, help='FPS for the mp4 video of optimization progress (if saved)', default=25, show_default=True)
+# Anti-saturation options (jitter/flip default off for sequences to preserve temporal coherence)
+@saturation_options()
 # Extra parameters for saving the results
 @click.option('--outdir', type=click.Path(file_okay=False), help='Directory path to save the results', default=os.path.join(os.getcwd(), 'out', 'discriminator_synthesis'), show_default=True, metavar='DIR')
 @click.option('--description', '-desc', type=str, help='Additional description name for the directory path to save results', default='', show_default=True)
@@ -1190,6 +1406,13 @@ def random_interpolation(
         unzoom_octave: Optional[bool],
         seed_sec: float,
         fps: int,
+        anti_saturation: bool,
+        soft_clip: bool,
+        target_mean: Optional[float],
+        target_std: Optional[float],
+        grad_smooth: float,
+        jitter: int,
+        flip: bool,
         outdir: Union[str, os.PathLike],
         description: str,
 ):
@@ -1208,6 +1431,9 @@ def random_interpolation(
     # Get model resolution
     model_resolution = D.img_resolution
     model = DiscriminatorFeatures(D).requires_grad_(False).to(device)
+
+    # Anti-saturation configuration
+    config = build_dream_config(anti_saturation, soft_clip, target_mean, target_std, grad_smooth, jitter, flip)
 
     layers = layers.split(',')
     # Get all available layers
@@ -1262,7 +1488,8 @@ def random_interpolation(
         dreamed_image = deep_dream(image, model, model_resolution, layers=layers, channels=channels, seed=None,
                                    normed=norm_model_layers, disable_inner_tqdm=True, ignore_initial_transform=True,
                                    sqrt_normed=sqrt_norm_model_layers, iterations=iterations, lr=learning_rate,
-                                   octave_scale=octave_scale, num_octaves=num_octaves, unzoom_octave=unzoom_octave)
+                                   octave_scale=octave_scale, num_octaves=num_octaves, unzoom_octave=unzoom_octave,
+                                   config=config)
 
         # Save the resulting image and initial image
         filename = f'{image_noise}-interpolation_frame_{idx:0{n_digits}d}.jpg'
@@ -1286,6 +1513,7 @@ def random_interpolation(
             'octave_scale': octave_scale,
             'num_octaves': num_octaves,
             'unzoom_octave': unzoom_octave},
+        'anti_saturation_options': vars(config),
         'extra_parameters': {
             'outdir': run_dir,
             'description': description}
@@ -1354,7 +1582,8 @@ def _dream_video_worker(rank: int, num_gpus: int, volume_path: str, run_dir: str
                 octave_scale=opts['octave_scale'], num_octaves=opts['num_octaves'],
                 unzoom_octave=opts['unzoom_octave'],
                 disable_inner_tqdm=True,
-                ignore_initial_transform=True
+                ignore_initial_transform=True,
+                config=opts['dream_config']
             )
             if dreamed.ndim == 3:
                 dreamed = dreamed[None]
@@ -1416,6 +1645,8 @@ def combine_axis_videos(video_paths: List[Union[str, os.PathLike]],
 @click.option('--fps', type=gen_utils.parse_fps, help='FPS for the output videos', default=25, show_default=True)
 @click.option('--combine', type=bool, help='Stack the axis videos side by side into a single comparison video', default=True, show_default=True)
 @click.option('--display-height', type=click.IntRange(min=64), help='Height of the combined comparison video', default=512, show_default=True)
+# Anti-saturation options (jitter/flip default off for videos to preserve temporal coherence)
+@saturation_options()
 # Extra parameters
 @click.option('--outdir', type=click.Path(file_okay=False), help='Output directory', default=os.path.join(os.getcwd(), 'out', 'discriminator_synthesis'), show_default=True, metavar='DIR')
 @click.option('--description', '-desc', type=str, help='Additional description for output directory', default='', show_default=True)
@@ -1445,6 +1676,13 @@ def discriminator_dream_video(
         fps: int,
         combine: bool,
         display_height: int,
+        anti_saturation: bool,
+        soft_clip: bool,
+        target_mean: Optional[float],
+        target_std: Optional[float],
+        grad_smooth: float,
+        jitter: int,
+        flip: bool,
         outdir: Union[str, os.PathLike],
         description: str,
 ):
@@ -1508,6 +1746,9 @@ def discriminator_dream_video(
     for axis in axes:
         os.makedirs(os.path.join(run_dir, f'axis_{axis}'), exist_ok=True)
 
+    # Anti-saturation configuration (picklable dataclass; passed to each worker)
+    config = build_dream_config(anti_saturation, soft_clip, target_mean, target_std, grad_smooth, jitter, flip)
+
     # Generate the noise volume once and share it with the workers via a memory-mapped file
     print(f'Generating a ({num_frames}, {img_size}, {img_size}) 3D Perlin noise volume...')
     noise_device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -1534,6 +1775,7 @@ def discriminator_dream_video(
         'axes': axes,
         'multiple': multiple,
         'batch_size': batch_size,
+        'dream_config': config,
     }
 
     if num_gpus > 1:
@@ -1592,6 +1834,7 @@ def discriminator_dream_video(
             'gpus': num_gpus,
             'batch_size': batch_size
         },
+        'anti_saturation_options': vars(config),
         'extra_parameters': {
             'outdir': run_dir,
             'description': description
