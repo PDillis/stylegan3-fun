@@ -27,15 +27,24 @@ def _init():
     if os.name == 'nt':
         extras['extra_cflags'] = ['/std:c++17']
     if _plugin is None:
-        _plugin = custom_ops.get_plugin(
-            module_name='filtered_lrelu_plugin',
-            sources=['filtered_lrelu.cpp', 'filtered_lrelu_wr.cu', 'filtered_lrelu_rd.cu', 'filtered_lrelu_ns.cu'],
-            headers=['filtered_lrelu.h', 'filtered_lrelu.cu'],
-            source_dir=os.path.dirname(__file__),
-            extra_cuda_cflags=['--use_fast_math', '--allow-unsupported-compiler'],
-            **extras,
-        )
-    return True
+        if custom_ops.use_ref_ops():
+            _plugin = False
+        else:
+            try:
+                _plugin = custom_ops.get_plugin(
+                    module_name='filtered_lrelu_plugin',
+                    sources=['filtered_lrelu.cpp', 'filtered_lrelu_wr.cu', 'filtered_lrelu_rd.cu', 'filtered_lrelu_ns.cu'],
+                    headers=['filtered_lrelu.h', 'filtered_lrelu.cu'],
+                    source_dir=os.path.dirname(__file__),
+                    extra_cuda_cflags=['--use_fast_math', '--allow-unsupported-compiler'],
+                    **extras,
+                )
+            except Exception as e:
+                _plugin = False
+                warnings.warn('Failed to build the filtered_lrelu CUDA plugin; falling back to the (slower) reference '
+                              'PyTorch implementation. Check CUDA_HOME points to a full CUDA toolkit, or set '
+                              f'STYLEGAN3_USE_REF_OPS=1 to silence this warning. Build error:\n{e}')
+    return _plugin is not False
 
 def _get_filter_size(f):
     if f is None:

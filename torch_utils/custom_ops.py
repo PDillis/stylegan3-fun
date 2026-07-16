@@ -24,6 +24,14 @@ from torch.utils.file_baton import FileBaton
 verbosity = 'brief' # Verbosity level: 'none', 'brief', 'full'
 
 #----------------------------------------------------------------------------
+
+def use_ref_ops():
+    """Escape hatch: set STYLEGAN3_USE_REF_OPS=1 to skip compiling the custom
+    CUDA plugins altogether and use the reference (pure PyTorch) implementations.
+    Slower, but requires no CUDA toolkit/compiler on the machine."""
+    return os.environ.get('STYLEGAN3_USE_REF_OPS', '').lower() in ('1', 'true', 'yes', 'on')
+
+#----------------------------------------------------------------------------
 # Internal helper funcs.
 
 def _find_compiler_bindir():
